@@ -1,5 +1,4 @@
 ﻿//using CommunityToolkit.HighPerformance;
-using CommunityToolkit.HighPerformance.Buffers;
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
@@ -7,6 +6,7 @@ using System.Net;
 using System.Net.Mail;
 using System.Net.Sockets;
 using System.Text;
+using Serilog;
 
 namespace TFTPServer
 {
@@ -43,11 +43,11 @@ namespace TFTPServer
         }
         public int GetBlockSize()
         {
-            if ( options == null)
+            if (options == null)
             {
                 return 512;
             }
-            else if ( ! options.TryGetValue("blksize", out string? strBlksize))
+            else if ( ! options.TryGetValue("blksize", out string? strBlksize) )
             {
                 return 512;
             }
@@ -76,7 +76,9 @@ namespace TFTPServer
                 // ReuseAddress AND Bind() are important to have multiple Receives() in flight
                 //
                 socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                socket.Client.Bind(new IPEndPoint(IPAddress.Any, port));
+                var listenEndpoint = new IPEndPoint(IPAddress.Any, port);
+                socket.Client.Bind(listenEndpoint);
+                Log.Information("TFTP server is listening to: {listenEndpoint}",listenEndpoint);
 
                 for (;;)
                 {
@@ -87,123 +89,121 @@ namespace TFTPServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine("X: AcceptRequest\n" + ex.Message);
+                Log.Error(ex,"AcceptRequest");
             }
         }
         static async Task HandleRequest(ReadOnlyMemory<byte> requestBuf, IPEndPoint client)
         {
-            var bufWriter = new ArrayBufferWriter<byte>();
+            var tmpWriter = new ArrayBufferWriter<byte>();
             using var socket = new UdpClient();
             socket.Connect(client);
 
             try
             {
+                var timeout = TimeSpan.FromSeconds(3);
                 var request = Parse.ParseRequest(requestBuf);
                 PrintRequest(client, request);
 
                 if (request.opcode != OPCODE.RRQ)
                 {
-                    await socket.SendAsync(CreateError("server only supports READ", 12, bufWriter));
+                    await socket.SendAsync(CreateError("server only supports READ", 12, tmpWriter));
                 }
                 else if (!File.Exists(request.filename))
                 {
-                    await socket.SendAsync(CreateError("File not found", 2, bufWriter));
+                    await socket.SendAsync(CreateError("File not found", 2, tmpWriter));
                 }
                 else
                 {
                     if (request.options == null)
                     {
-                        await socket.SendAsync(CreateACK(0, bufWriter));
+                        // if there are no options, start with DATA block 1
+                        //await socket.SendAsync(CreateACK(0, bufWriter));
+                    }
+                    else if ( ! await SendBlockWaitForACK(socket, 0, CreateOACK(request, tmpWriter), timeout))
+                    {
+                        // sending/ACKing block 0 failed
                     }
                     else
                     {
-                        await socket.SendAsync(CreateOACK(request, bufWriter));
-                    }
-                    using (var rdr = new FileStream(request.filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
-                    {
-                        await HandleReadRequest(socket, rdr, request.GetBlockSize(), bufWriter);
+                        using (var rdr = new FileStream(request.filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+                        {
+                            int blksize = request.GetBlockSize();
+                            UInt16 blocknumber = 1;
+                            for (;;)
+                            {
+                                var dataBlock = await CreateDATA(rdr, blocknumber, blksize, tmpWriter);
+                                if ( ! await SendBlockWaitForACK(socket, blocknumber, dataBlock, timeout) )
+                                {
+                                    // sending/waiting failed
+                                }
+                                else if ( dataBlock.Length < blksize )
+                                {
+                                    // last block sent
+                                    Log.Information("transfer success.");
+                                    break;
+                                }
+                                else
+                                {
+                                    blocknumber += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
             catch (ParseException pex)
             {
-                Console.Error.WriteLine($"request is malformed. {pex.Message}");
-                await socket.SendAsync(CreateError($"request is malformed. {pex.Message}", 14, bufWriter));
+                Log.Error("request is malformed. {ParseException}", pex.Message);
+                await socket.SendAsync(CreateError($"request is malformed. {pex.Message}", 14, tmpWriter));
             }
             finally
             {
                 socket.Close();
             }
         }
-        static async Task HandleReadRequest(UdpClient client, FileStream rdr, int blksize, ArrayBufferWriter<byte> buf)
+        static async Task<bool> SendBlockWaitForACK(UdpClient socket, UInt16 expectedBlocknumber, ReadOnlyMemory<byte> block, TimeSpan timeoutForACK)
         {
-            UInt16 blockNumber = 0;
-            UInt64 dataBytesSent = 0;
-            //int? lastBytesRead = null;
-            int? bytesRead = null;
+            int sentbytes = await socket.SendAsync(block);
+            Log.Debug("sent block {blocknumber} ({sentbytes} bytes)", expectedBlocknumber, sentbytes);
 
-            for (;;)
+            var receiveTask = socket.ReceiveAsync();
+            if ( ! receiveTask.Wait( timeoutForACK ) )
             {
-                // wait for the ACK of the block
-                var receiveTask = client.ReceiveAsync();
-                if ( ! receiveTask.Wait( millisecondsTimeout: 3000 ) )
-                {
-                    Console.Error.WriteLine($"did not receive ACK for block #{blockNumber}");
-                    break;
-                }
-                else if ( receiveTask.Result.Buffer.Length < 4 )
-                {
-                    Console.Error.WriteLine($"received data is too small. expected: ACK for block# {blockNumber}. got {bytesToHex(receiveTask.Result.Buffer)}");
-                    break;
-                }
-                else
-                {
-                    ReadOnlyMemory<byte> answer = receiveTask.Result.Buffer.AsMemory<byte>();
-                    OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
+                Log.Error("did not receive ACK for block {blockNumber} within {timeoutForACK}", expectedBlocknumber, timeoutForACK);
+            }
+            else if ( receiveTask.Result.Buffer.Length < 4 )
+            {
+                Log.Error("received data is too small. expected: ACK for block {blocknumber}. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Result.Buffer));
+            }
+            else
+            {
+                ReadOnlyMemory<byte> answer = receiveTask.Result.Buffer.AsMemory<byte>();
+                OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
 
-                    if (opcode == OPCODE.ERROR)
+                if (opcode == OPCODE.ERROR)
+                {
+                    (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
+                    Log.Error("received error from client. code: {code}, message: {message}");
+                }
+                else if ( opcode != OPCODE.ACK )
+                {
+                     Log.Error("expected: ACK for block {blockNumber} or ERROR. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Result.Buffer));
+                }
+                else 
+                {
+                    UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
+                    if ( ackForBlock != expectedBlocknumber ) 
                     {
-                        (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
-                        Console.Error.WriteLine($"received error from client. code: {code}, message: {message}");
-                        break;
-                    }
-                    else if ( opcode == OPCODE.ACK )
-                    {
-                        UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
-                        if ( ackForBlock != blockNumber ) 
-                        {
-                            Console.Error.WriteLine($"expected: ACK for block {blockNumber}. received ACK for block# {ackForBlock}.");
-                            break;
-                        }
-                        else if ( bytesRead.HasValue && bytesRead.Value < blksize)
-                        {
-                            // ACK for the last data packet
-                            Console.WriteLine($"transfer finished. client {client.Client.RemoteEndPoint}, bytes {dataBytesSent}, blksize {blksize}");
-                            break;
-                        }
-                        else
-                        { 
-                            blockNumber += 1;
-                            buf.Clear();
-                            var header = buf.GetMemory(4);
-                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2).Span, (UInt16)OPCODE.DATA);
-                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2).Span,         blockNumber);
-                            buf.Advance(4);
-                            var mem = buf.GetMemory(blksize);
-                            bytesRead = await rdr.ReadAsync(mem.Slice(0, length: blksize));
-                            buf.Advance(bytesRead.Value);
-
-                            int sentbytes = await client.SendAsync(buf.WrittenMemory);
-                            Console.WriteLine($"sent block {blockNumber}. {sentbytes-4} bytes of data");
-                        }
+                        Log.Error("expected: ACK for block {blockNumber}. received ACK for block {ackForBlock}.", expectedBlocknumber, ackForBlock);
                     }
                     else
                     {
-                        Console.Error.WriteLine($"expected: ACK for block {blockNumber} or ERROR. got {bytesToHex(receiveTask.Result.Buffer)}");
-                        break;
+                        // finally!
+                        return true;
                     }
                 }
             }
+            return false;
         }
         static ReadOnlyMemory<byte> CreateOACK(Request request, ArrayBufferWriter<byte> writer)
         {
@@ -226,6 +226,21 @@ namespace TFTPServer
                 Encoding.ASCII.GetBytes(value.AsSpan(), writer);
                 WriteByte(0, writer);
             }
+
+            return writer.WrittenMemory;
+        }
+        static async Task<ReadOnlyMemory<byte>> CreateDATA(FileStream rdr, UInt16 blocknumber, int blksize, ArrayBufferWriter<byte> writer)
+        {
+            writer.Clear();
+            
+            var header = writer.GetMemory(4);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2).Span, (UInt16)OPCODE.DATA);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2).Span,         blocknumber);
+            writer.Advance(4);
+
+            var mem = writer.GetMemory(blksize);
+            int bytesRead = await rdr.ReadAsync(mem.Slice(0, length: blksize));
+            writer.Advance(bytesRead);
 
             return writer.WrittenMemory;
         }
@@ -287,5 +302,76 @@ namespace TFTPServer
         {
             return BitConverter.ToString(buf).Replace("-", "");
         }
+                static async Task ___HandleReadRequest(UdpClient client, FileStream rdr, int blksize, ArrayBufferWriter<byte> buf)
+        {
+            UInt16 blockNumber = 0;
+            UInt64 dataBytesSent = 0;
+            //int? lastBytesRead = null;
+            int? bytesRead = null;
+
+            for (;;)
+            {
+                // wait for the ACK of the block
+                var receiveTask = client.ReceiveAsync();
+                if ( ! receiveTask.Wait( millisecondsTimeout: 3000 ) )
+                {
+                    Log.Error("did not receive ACK for block #{blockNumber}", blockNumber);
+                    break;
+                }
+                else if ( receiveTask.Result.Buffer.Length < 4 )
+                {
+                    Console.Error.WriteLine($"received data is too small. expected: ACK for block# {blockNumber}. got {bytesToHex(receiveTask.Result.Buffer)}");
+                    break;
+                }
+                else
+                {
+                    ReadOnlyMemory<byte> answer = receiveTask.Result.Buffer.AsMemory<byte>();
+                    OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
+
+                    if (opcode == OPCODE.ERROR)
+                    {
+                        (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
+                        Console.Error.WriteLine($"received error from client. code: {code}, message: {message}");
+                        break;
+                    }
+                    else if ( opcode == OPCODE.ACK )
+                    {
+                        UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
+                        if ( ackForBlock != blockNumber ) 
+                        {
+                            Console.Error.WriteLine($"expected: ACK for block {blockNumber}. received ACK for block# {ackForBlock}.");
+                            break;
+                        }
+                        else if ( bytesRead.HasValue && bytesRead.Value < blksize)
+                        {
+                            // ACK for the last data packet
+                            Console.WriteLine($"transfer finished. client {client.Client.RemoteEndPoint}, bytes {dataBytesSent}, blksize {blksize}");
+                            break;
+                        }
+                        else
+                        { 
+                            blockNumber += 1;
+                            buf.Clear();
+                            var header = buf.GetMemory(4);
+                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2).Span, (UInt16)OPCODE.DATA);
+                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2).Span,         blockNumber);
+                            buf.Advance(4);
+                            var mem = buf.GetMemory(blksize);
+                            bytesRead = await rdr.ReadAsync(mem.Slice(0, length: blksize));
+                            buf.Advance(bytesRead.Value);
+
+                            int sentbytes = await client.SendAsync(buf.WrittenMemory);
+                            Console.WriteLine($"sent block {blockNumber}. {sentbytes-4} bytes of data");
+                        }
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"expected: ACK for block {blockNumber} or ERROR. got {bytesToHex(receiveTask.Result.Buffer)}");
+                        break;
+                    }
+                }
+            }
+        }
+
     }
 }
