@@ -1,4 +1,5 @@
-﻿using System.Buffers;
+﻿using System;
+using System.Buffers;
 using System.Text;
 
 namespace TFTPServer
@@ -36,6 +37,18 @@ namespace TFTPServer
 
             return request;
         }
+        public static (UInt16, string?) ParseError(ReadOnlyMemory<byte> buffer)
+        {
+            var seq = new ReadOnlySequence<byte>(buffer);
+            var rdr = new SequenceReader<byte>(seq);
+
+            rdr.TryReadBigEndian(out short scode);
+            UInt16 code = (UInt16)scode;
+            string? errorMessage = ReadNextField(ref rdr, "error message");
+
+            return (code, errorMessage);
+        }
+
         static string? ReadNextField(ref SequenceReader<byte> rdr, string context)
         {
             if (!rdr.TryReadTo(
@@ -80,6 +93,17 @@ namespace TFTPServer
                 }
             }
             return options;
+        }
+        public static UInt16 ReadUInt16BigEndian(ReadOnlyMemory<byte> buffer)
+        {
+            var seq = new ReadOnlySequence<byte>(buffer);
+            var rdr = new SequenceReader<byte>(seq);
+            if ( !rdr.TryReadBigEndian(out short value) )
+            {
+                throw new ApplicationException($"fatal: could not read UInt16 out of buffer. buffer length = {buffer.Length}");
+            }
+
+            return (UInt16)value;
         }
     }
 }

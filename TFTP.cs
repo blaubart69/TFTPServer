@@ -1,6 +1,10 @@
-﻿using System.Buffers;
+﻿//using CommunityToolkit.HighPerformance;
+using CommunityToolkit.HighPerformance.Buffers;
+using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.Mail;
 using System.Net.Sockets;
 using System.Text;
 
@@ -13,6 +17,7 @@ namespace TFTPServer
             3     Data (DATA)
             4     Acknowledgment (ACK)
             5     Error (ERROR)
+            6     Option Acknowledgment (OACK)
      */
     enum OPCODE : uint
     {
@@ -20,20 +25,36 @@ namespace TFTPServer
         WRQ = 2,
         DATA = 3,
         ACK = 4,
-        ERROR = 5
+        ERROR = 5,
+        OACK = 6
     }
     internal class Request
     {
-        public readonly UInt16 opcode;
+        public readonly OPCODE opcode;
         public readonly string filename;
         public readonly string mode;
         public Dictionary<string, string>? options;
 
         public Request(UInt16 opcode, string filename, string mode)
         {
-            this.opcode = opcode;
+            this.opcode = (OPCODE)opcode;
             this.filename = filename;
             this.mode = mode;
+        }
+        public int GetBlockSize()
+        {
+            if ( options == null)
+            {
+                return 512;
+            }
+            else if ( ! options.TryGetValue("blksize", out string? strBlksize))
+            {
+                return 512;
+            }
+            else
+            {
+                return Convert.ToInt32(strBlksize);
+            }
         }
     }
     internal class TFTP
@@ -50,16 +71,18 @@ namespace TFTPServer
         {
             try
             {
+                var socket = new System.Net.Sockets.UdpClient();
+                //
+                // ReuseAddress AND Bind() are important to have multiple Receives() in flight
+                //
+                socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                socket.Client.Bind(new IPEndPoint(IPAddress.Any, port));
+
                 for (;;)
                 {
-                    var client = new System.Net.Sockets.UdpClient();
-                    //
-                    // ReuseAddress AND Bind() are important to have multiple Receives() in flight
-                    //
-                    client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                    client.Client.Bind(new IPEndPoint(IPAddress.Any, port));
-                    var request = await client.ReceiveAsync().ConfigureAwait(false);
-                    HandleRequest(request, client);
+                    var request = await socket.ReceiveAsync().ConfigureAwait(false);
+                    ReadOnlyMemory<byte> requestMem = request.Buffer.AsMemory<byte>();
+                    HandleRequest(request.Buffer.AsMemory<byte>(), request.RemoteEndPoint);
                 }
             }
             catch (Exception ex)
@@ -67,44 +90,153 @@ namespace TFTPServer
                 Console.WriteLine("X: AcceptRequest\n" + ex.Message);
             }
         }
-        static async void HandleRequest(UdpReceiveResult receive, UdpClient client)
+        static async Task HandleRequest(ReadOnlyMemory<byte> requestBuf, IPEndPoint client)
         {
+            var bufWriter = new ArrayBufferWriter<byte>();
+            using var socket = new UdpClient();
+            socket.Connect(client);
+
             try
             {
-                string hexPayload = BitConverter.ToString(receive.Buffer).Replace("-", "");
-                Console.WriteLine($"request from {receive.RemoteEndPoint}. {receive.Buffer.Length} bytes. {hexPayload}");
-                try
+                var request = Parse.ParseRequest(requestBuf);
+                PrintRequest(client, request);
+
+                if (request.opcode != OPCODE.RRQ)
                 {
-                    var request = Parse.ParseRequest(receive.Buffer);
-                    PrintRequest(request);
-                    var errBuf = CreateError("SCHOD");
-                    Console.WriteLine($"sending: {BitConverter.ToString(errBuf).Replace("-", "")}");
-                    client.Send(errBuf, errBuf.Length, receive.RemoteEndPoint);
+                    await socket.SendAsync(CreateError("server only supports READ", 12, bufWriter));
                 }
-                catch (ParseException pex)
+                else if (!File.Exists(request.filename))
                 {
-                    Console.Error.WriteLine($"request is malformed. {pex.Message}");
+                    await socket.SendAsync(CreateError("File not found", 2, bufWriter));
                 }
+                else
+                {
+                    if (request.options == null)
+                    {
+                        await socket.SendAsync(CreateACK(0, bufWriter));
+                    }
+                    else
+                    {
+                        await socket.SendAsync(CreateOACK(request, bufWriter));
+                    }
+                    using (var rdr = new FileStream(request.filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+                    {
+                        await HandleReadRequest(socket, rdr, request.GetBlockSize(), bufWriter);
+                    }
+                }
+            }
+            catch (ParseException pex)
+            {
+                Console.Error.WriteLine($"request is malformed. {pex.Message}");
+                await socket.SendAsync(CreateError($"request is malformed. {pex.Message}", 14, bufWriter));
             }
             finally
             {
-                client.Close();
+                socket.Close();
             }
         }
-        static void PrintRequest(Request request)
+        static async Task HandleReadRequest(UdpClient client, FileStream rdr, int blksize, ArrayBufferWriter<byte> buf)
         {
-            Console.WriteLine(
-                $"opcode    {request.opcode}"
-            + $"\nfilename  {request.filename}"
-            + $"\nmode      {request.mode}");
+            UInt16 blockNumber = 0;
+            UInt64 dataBytesSent = 0;
+            //int? lastBytesRead = null;
+            int? bytesRead = null;
 
-            if (request.options != null)
+            for (;;)
             {
-                foreach (var opt in request.options)
+                // wait for the ACK of the block
+                var receiveTask = client.ReceiveAsync();
+                if ( ! receiveTask.Wait( millisecondsTimeout: 3000 ) )
                 {
-                    Console.WriteLine($"option: [{opt.Key}]\t[{opt.Value}]");
+                    Console.Error.WriteLine($"did not receive ACK for block #{blockNumber}");
+                    break;
+                }
+                else if ( receiveTask.Result.Buffer.Length < 4 )
+                {
+                    Console.Error.WriteLine($"received data is too small. expected: ACK for block# {blockNumber}. got {bytesToHex(receiveTask.Result.Buffer)}");
+                    break;
+                }
+                else
+                {
+                    ReadOnlyMemory<byte> answer = receiveTask.Result.Buffer.AsMemory<byte>();
+                    OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
+
+                    if (opcode == OPCODE.ERROR)
+                    {
+                        (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
+                        Console.Error.WriteLine($"received error from client. code: {code}, message: {message}");
+                        break;
+                    }
+                    else if ( opcode == OPCODE.ACK )
+                    {
+                        UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
+                        if ( ackForBlock != blockNumber ) 
+                        {
+                            Console.Error.WriteLine($"expected: ACK for block {blockNumber}. received ACK for block# {ackForBlock}.");
+                            break;
+                        }
+                        else if ( bytesRead.HasValue && bytesRead.Value < blksize)
+                        {
+                            // ACK for the last data packet
+                            Console.WriteLine($"transfer finished. client {client.Client.RemoteEndPoint}, bytes {dataBytesSent}, blksize {blksize}");
+                            break;
+                        }
+                        else
+                        { 
+                            blockNumber += 1;
+                            buf.Clear();
+                            var header = buf.GetMemory(4);
+                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2).Span, (UInt16)OPCODE.DATA);
+                            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2).Span,         blockNumber);
+                            buf.Advance(4);
+                            var mem = buf.GetMemory(blksize);
+                            bytesRead = await rdr.ReadAsync(mem.Slice(0, length: blksize));
+                            buf.Advance(bytesRead.Value);
+
+                            int sentbytes = await client.SendAsync(buf.WrittenMemory);
+                            Console.WriteLine($"sent block {blockNumber}. {sentbytes-4} bytes of data");
+                        }
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"expected: ACK for block {blockNumber} or ERROR. got {bytesToHex(receiveTask.Result.Buffer)}");
+                        break;
+                    }
                 }
             }
+        }
+        static ReadOnlyMemory<byte> CreateOACK(Request request, ArrayBufferWriter<byte> writer)
+        {
+            writer.Clear();
+            WriteUInt16((UInt16)OPCODE.OACK, writer);
+
+            foreach ( var opt in request.options)
+            {
+                string value;
+                if ( "tsize".Equals(opt.Key,StringComparison.OrdinalIgnoreCase) )
+                {
+                    value = new FileInfo(request.filename).Length.ToString();
+                }
+                else
+                {
+                    value = opt.Value;
+                }
+                Encoding.ASCII.GetBytes(opt.Key.AsSpan(), writer);
+                WriteByte(0, writer);
+                Encoding.ASCII.GetBytes(value.AsSpan(), writer);
+                WriteByte(0, writer);
+            }
+
+            return writer.WrittenMemory;
+        }
+        static ReadOnlyMemory<byte> CreateACK(UInt16 blocknumber, ArrayBufferWriter<byte> writer)
+        {
+            writer.Clear();
+            var header = writer.GetSpan(4);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2), (UInt16)OPCODE.ACK);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2), (UInt16)blocknumber);
+            writer.Advance(4);
+            return writer.WrittenMemory;
         }
         /*
            2 bytes     2 bytes      string    1 byte
@@ -112,24 +244,48 @@ namespace TFTPServer
          | Opcode |  ErrorCode |   ErrMsg   |   0  |
           -----------------------------------------
                   Figure 5-4: ERROR packet
-         */
-        static byte[] CreateError(string message)
+        */
+        static ReadOnlyMemory<byte> CreateError(string message, UInt16 code, ArrayBufferWriter<byte> writer)
         {
-            var ms = new MemoryStream();
-            BinaryWriter bw = new BinaryWriter(ms);
+            writer.Clear();
 
-            var header = new byte[4].AsSpan();
-            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0,2), (UInt16)OPCODE.ERROR);
-            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2,2), (UInt16)99);
-            bw.Write(header);
-            bw.Write(Encoding.ASCII.GetBytes(message));
-            bw.Write((byte)0);
+            var header = writer.GetSpan(4);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2), (UInt16)OPCODE.ERROR);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2), (UInt16)code);
+            writer.Advance(4);
+            
+            Encoding.ASCII.GetBytes(message.AsSpan(), writer);
 
-            return ms.ToArray();
+            byte Zero = 0;
+            writer.Write(new Span<byte>(ref Zero));
+            return writer.WrittenMemory;
         }
-        static void CreateACK()
+        static void WriteUInt16(UInt16 value, ArrayBufferWriter<byte> writer)
         {
-            ArrayPool<byte>.
+            var header = writer.GetSpan(2);
+            BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2), value);
+            writer.Advance(2);
+        }
+        static void WriteByte(byte value, ArrayBufferWriter<byte> writer)
+        {
+            var data = new Span<byte>(ref value);
+            writer.Write(data);
+        }
+        static void PrintRequest(IPEndPoint client, Request request)
+        {
+            Console.WriteLine($"{request.opcode} from {client}: mode [{request.mode}] filename [{request.filename}]");
+
+            if (request.options != null)
+            {
+                foreach (var opt in request.options)
+                {
+                    Console.WriteLine($"  option: [{opt.Key}]\t[{opt.Value}]");
+                }
+            }
+        }
+        static string bytesToHex(byte[] buf)
+        {
+            return BitConverter.ToString(buf).Replace("-", "");
         }
     }
 }
