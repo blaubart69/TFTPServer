@@ -168,7 +168,7 @@ namespace TFTPServer
                     else if (dataBlock.Length < blksize)
                     {
                         // last block sent
-                        Log.Information("transfer success.");
+                        Log.Information("transfer success. {filesent} -> {remote}", request.filename, socket.Client.RemoteEndPoint);
                         break;
                     }
                     else
@@ -187,44 +187,48 @@ namespace TFTPServer
             int sentbytes = await socket.SendAsync(block);
             Log.Debug("sent block {blocknumber} ({sentbytes} bytes)", expectedBlocknumber, sentbytes);
 
-            var receiveTask = socket.ReceiveAsync();
-            if ( ! receiveTask.Wait( timeoutForACK ) )
+            try
+            {
+                var receiveTask = await socket.ReceiveAsync().WaitAsync(timeoutForACK).ConfigureAwait(false);
+                if ( receiveTask.Buffer.Length < 4 )
+                {
+                    Log.Error("received data is too small. expected: ACK for block {blocknumber}. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Buffer));
+                }
+                else
+                {
+                    ReadOnlyMemory<byte> answer = receiveTask.Buffer.AsMemory<byte>();
+                    OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
+
+                    if (opcode == OPCODE.ERROR)
+                    {
+                        (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
+                        Log.Error("received error from client. code: {code}, message: {message}");
+                    }
+                    else if ( opcode != OPCODE.ACK )
+                    {
+                        Log.Error("expected: ACK for block {blockNumber} or ERROR. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Buffer));
+                    }
+                    else 
+                    {
+                        UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
+                        if ( ackForBlock != expectedBlocknumber ) 
+                        {
+                            Log.Error("expected: ACK for block {blockNumber}. received ACK for block {ackForBlock}.", expectedBlocknumber, ackForBlock);
+                        }
+                        else
+                        {
+                            Log.Debug("received ACK for block {expectedBlocknumber}", expectedBlocknumber);
+                            // finally!
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (TimeoutException)
             {
                 Log.Error("did not receive ACK for block {blockNumber} within {timeoutForACK}", expectedBlocknumber, timeoutForACK);
             }
-            else if ( receiveTask.Result.Buffer.Length < 4 )
-            {
-                Log.Error("received data is too small. expected: ACK for block {blocknumber}. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Result.Buffer));
-            }
-            else
-            {
-                ReadOnlyMemory<byte> answer = receiveTask.Result.Buffer.AsMemory<byte>();
-                OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
 
-                if (opcode == OPCODE.ERROR)
-                {
-                    (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
-                    Log.Error("received error from client. code: {code}, message: {message}");
-                }
-                else if ( opcode != OPCODE.ACK )
-                {
-                     Log.Error("expected: ACK for block {blockNumber} or ERROR. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Result.Buffer));
-                }
-                else 
-                {
-                    UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
-                    if ( ackForBlock != expectedBlocknumber ) 
-                    {
-                        Log.Error("expected: ACK for block {blockNumber}. received ACK for block {ackForBlock}.", expectedBlocknumber, ackForBlock);
-                    }
-                    else
-                    {
-                        Log.Debug("received ACK for block {expectedBlocknumber}", expectedBlocknumber);
-                        // finally!
-                        return true;
-                    }
-                }
-            }
             return false;
         }
         static ReadOnlyMemory<byte> CreateOACK(Dictionary<string,string> options, long filesize, ArrayBufferWriter<byte> writer)
@@ -310,15 +314,15 @@ namespace TFTPServer
         }
         static void PrintRequest(IPEndPoint client, Request request)
         {
-            Console.WriteLine($"{request.opcode} from {client}: mode [{request.mode}] filename [{request.filename}]");
+            StringBuilder sb = new StringBuilder();
+            sb.Append($"{request.opcode} from {client}: mode [{request.mode}] filename [{request.filename}]");
 
             if (request.options != null)
             {
-                foreach (var opt in request.options)
-                {
-                    Console.WriteLine($"  option: [{opt.Key}]\t[{opt.Value}]");
-                }
+                sb.Append(" options: ");
+                sb.Append(String.Join(" ", request.options.Select(opt => $"[{opt.Key} {opt.Value}]")));
             }
+            Log.Information("{request}", sb.ToString());
         }
         static string bytesToHex(byte[] buf)
         {
