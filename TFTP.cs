@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Mail;
 using System.Net.Sockets;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 using Serilog;
 
 namespace TFTPServer
@@ -84,7 +85,14 @@ namespace TFTPServer
                 {
                     var request = await socket.ReceiveAsync().ConfigureAwait(false);
                     ReadOnlyMemory<byte> requestMem = request.Buffer.AsMemory<byte>();
-                    HandleRequest(request.Buffer.AsMemory<byte>(), request.RemoteEndPoint);
+                    try
+                    {
+                        _ = HandleRequest(request.Buffer.AsMemory<byte>(), request.RemoteEndPoint);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "HandleRequest failed");
+                    }
                 }
             }
             catch (Exception ex)
@@ -94,67 +102,84 @@ namespace TFTPServer
         }
         static async Task HandleRequest(ReadOnlyMemory<byte> requestBuf, IPEndPoint client)
         {
-            var tmpWriter = new ArrayBufferWriter<byte>();
-            using var socket = new UdpClient();
-            socket.Connect(client);
+            UdpClient? socket = null;
 
             try
             {
-                var timeout = TimeSpan.FromSeconds(3);
+                socket = new UdpClient();
+                socket.Connect(client);
+
                 var request = Parse.ParseRequest(requestBuf);
                 PrintRequest(client, request);
 
                 if (request.opcode != OPCODE.RRQ)
                 {
-                    await socket.SendAsync(CreateError("server only supports READ", 12, tmpWriter));
-                }
-                else if (!File.Exists(request.filename))
-                {
-                    await socket.SendAsync(CreateError("File not found", 2, tmpWriter));
+                    await socket.SendAsync(CreateError("server only supports READ", 12));
                 }
                 else
                 {
-                    if (request.options == null)
-                    {
-                        // if there are no options, start with DATA block 1
-                        //await socket.SendAsync(CreateACK(0, bufWriter));
-                    }
-                    else if ( ! await SendBlockWaitForACK(socket, 0, CreateOACK(request, tmpWriter), timeout))
-                    {
-                        // sending/ACKing block 0 failed
-                        return;
-                    }
-                    using var rdr = new FileStream(request.filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
-                    int blksize = request.GetBlockSize();
-                    UInt16 blocknumber = 1;
-                    for (; ; )
-                    {
-                        var dataBlock = await CreateDATA(rdr, blocknumber, blksize, tmpWriter);
-                        if (!await SendBlockWaitForACK(socket, blocknumber, dataBlock, timeout))
-                        {
-                            // sending/waiting failed
-                        }
-                        else if (dataBlock.Length < blksize)
-                        {
-                            // last block sent
-                            Log.Information("transfer success.");
-                            break;
-                        }
-                        else
-                        {
-                            blocknumber += 1;
-                        }
-                    }
+                    await HandleRead(socket, request, timeout: TimeSpan.FromSeconds(3));
                 }
             }
             catch (ParseException pex)
             {
                 Log.Error("request is malformed. {ParseException}", pex.Message);
-                await socket.SendAsync(CreateError($"request is malformed. {pex.Message}", 14, tmpWriter));
+                if ( socket != null )
+                {
+                    await socket.SendAsync(CreateError($"request is malformed. {pex.Message}", 14));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "HandleRequest");
             }
             finally
             {
-                socket.Close();
+                socket?.Close();
+            }
+        }
+        static async Task HandleRead(UdpClient socket, Request request, TimeSpan timeout)
+        {
+            try
+            {
+                using var rdr = new FileStream(request.filename, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
+                var tmpWriter = new ArrayBufferWriter<byte>();
+                if (request.options == null)
+                {
+                    // if there are no options, start with DATA block 1
+                    //await socket.SendAsync(CreateACK(0, bufWriter));
+                }
+                else if ( ! await SendBlockWaitForACK(socket, 0, CreateOACK(request.options, rdr.Length, tmpWriter), timeout))
+                {
+                    // sending/ACKing block 0 failed
+                    return;
+                }
+
+                int blksize = request.GetBlockSize();
+                UInt16 blocknumber = 1;
+                
+                for (;;)
+                {
+                    var dataBlock = await CreateDATA(rdr, blocknumber, blksize, tmpWriter);
+                    if (!await SendBlockWaitForACK(socket, blocknumber, dataBlock, timeout))
+                    {
+                        // sending/waiting failed
+                    }
+                    else if (dataBlock.Length < blksize)
+                    {
+                        // last block sent
+                        Log.Information("transfer success.");
+                        break;
+                    }
+                    else
+                    {
+                        blocknumber += 1;
+                    }
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                await socket.SendAsync(CreateError("File not found", 2));
             }
         }
         static async Task<bool> SendBlockWaitForACK(UdpClient socket, UInt16 expectedBlocknumber, ReadOnlyMemory<byte> block, TimeSpan timeoutForACK)
@@ -202,17 +227,17 @@ namespace TFTPServer
             }
             return false;
         }
-        static ReadOnlyMemory<byte> CreateOACK(Request request, ArrayBufferWriter<byte> writer)
+        static ReadOnlyMemory<byte> CreateOACK(Dictionary<string,string> options, long filesize, ArrayBufferWriter<byte> writer)
         {
             writer.Clear();
             WriteUInt16((UInt16)OPCODE.OACK, writer);
 
-            foreach ( var opt in request.options)
+            foreach ( var opt in options )
             {
                 string value;
                 if ( "tsize".Equals(opt.Key,StringComparison.OrdinalIgnoreCase) )
                 {
-                    value = new FileInfo(request.filename).Length.ToString();
+                    value = filesize.ToString();
                 }
                 else
                 {
@@ -257,9 +282,9 @@ namespace TFTPServer
           -----------------------------------------
                   Figure 5-4: ERROR packet
         */
-        static ReadOnlyMemory<byte> CreateError(string message, UInt16 code, ArrayBufferWriter<byte> writer)
+        static ReadOnlyMemory<byte> CreateError(string message, UInt16 code)
         {
-            writer.Clear();
+            ArrayBufferWriter<byte> writer = new ArrayBufferWriter<byte>();
 
             var header = writer.GetSpan(4);
             BinaryPrimitives.WriteUInt16BigEndian(header.Slice(0, 2), (UInt16)OPCODE.ERROR);
