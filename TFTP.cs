@@ -280,7 +280,7 @@ namespace TFTPServer
             return writer.WrittenMemory;
         }
         /*
-           2 bytes     2 bytes      string    1 byte
+           2 bytes    2 bytes      string    1 byte
           -----------------------------------------
          | Opcode |  ErrorCode |   ErrMsg   |   0  |
           -----------------------------------------
