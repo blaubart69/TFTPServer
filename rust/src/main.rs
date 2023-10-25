@@ -4,15 +4,50 @@ use std::{env,io};
 
 use tokio::net::UdpSocket;
 
-async fn handle_request(buflen : usize, received_buf : Vec<u8>, from : SocketAddr) {
+/*
+		opcode  operation
+		1     Read request (RRQ)
+		2     Write request (WRQ)
+		3     Data (DATA)
+		4     Acknowledgment (ACK)
+		5     Error (ERROR)
+		6     Option Acknowledgment (OACK)
+	*/
+
+
+// len
+// 2 ... bytes opcode
+// 1 ... at least one byte filename
+// 1 ... zero
+// 4 ... at least 4 bytes "mail" ("netascii", "octet", or "mail")
+// 1 ... zero
+// ----------
+// 9 ... minimal length of message
+//
+
+async fn handle_request(buflen : usize, buf : Vec<u8>, from : SocketAddr) {
 	println!("request from {} with len {}", from, buflen);
+	let req = &buf[0..buflen];
+
+	let s1 = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+		Err(e) => { eprintln!("handle_request(bind): {}",e); return; },
+		Ok(s) => s
+	};
+
+	if let Err(e) = s1.connect(from).await {
+		eprintln!("handle_request(connect): {}",e); 
+	}
+	else {
+		
+	}
+
 }
 
 async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
 
 	let sock69 = tokio::net::UdpSocket::bind(addr).await?;
 
-	println!("bound to: {}", sock69.local_addr()?);
+	println!("listening: {}", sock69.local_addr()?);
 	
 	loop {
         //let (datalen, from) = sock69.recv_from(&mut buf[..]).await?;
@@ -22,7 +57,6 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
 		match sock69.recv_from(&mut buf[..]).await {
 			Err(e) => eprintln!("{}",e),
 			Ok( (buflen, from) ) => {
-				println!("request from {}", from);
 				tokio::spawn( handle_request(buflen, buf, from) );
 			}
 		}
