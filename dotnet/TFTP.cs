@@ -1,12 +1,8 @@
-﻿//using CommunityToolkit.HighPerformance;
-using System;
-using System.Buffers;
+﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
-using System.Net.Mail;
 using System.Net.Sockets;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
 using Serilog;
 
 namespace TFTPServer
@@ -65,9 +61,10 @@ namespace TFTPServer
             return
                 Enumerable
                     .Repeat(port, numberListening)
-                    .Select(p => AcceptRequest(p))
+                    .Select(p => AcceptRequest2(p))
                     .ToArray();
         }
+        /*
         static async Task AcceptRequest(int port)
         {
             try
@@ -99,15 +96,66 @@ namespace TFTPServer
             {
                 Log.Error(ex,"AcceptRequest");
             }
+        }*/
+        static async Task AcceptRequest2(int port)
+        {
+            try
+            {
+                var socket = new System.Net.Sockets.Socket(SocketType.Dgram, ProtocolType.Udp);
+
+                //
+                // ReuseAddress AND Bind() are important to have multiple Receives() in flight
+                //
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                var listenEndpoint = new IPEndPoint(IPAddress.Any, port);
+                socket.Bind(listenEndpoint);
+                Log.Information("TFTP server is listening to: {listenEndpoint}", listenEndpoint);
+
+                for (;;)
+                {
+                    var buf = new ArraySegment<byte>(new byte[512]);
+                    var request = await socket.ReceiveMessageFromAsync(
+                        buf, new IPEndPoint(IPAddress.Any, 0)).ConfigureAwait(false);
+                        
+                    try
+                    {
+                        var mem = buf.AsMemory<byte>(0, request.ReceivedBytes);
+                        Log.Information("REQ from {remote} ({remoteFamily}) received on address/interface {address}/{interface}",
+                            request.RemoteEndPoint,
+                            request.RemoteEndPoint.AddressFamily,
+                            request.PacketInformation.Address,
+                            request.PacketInformation.Interface);
+
+                        _ = HandleRequest(mem, (IPEndPoint)request.RemoteEndPoint, request.PacketInformation.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "HandleRequest failed");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "AcceptRequest");
+            }
         }
-        static async Task HandleRequest(ReadOnlyMemory<byte> requestBuf, IPEndPoint client)
+        static async Task HandleRequest(ReadOnlyMemory<byte> requestBuf, IPEndPoint client, IPAddress receivedOn)
         {
             UdpClient? socket = null;
 
             try
             {
-                socket = new UdpClient();
-                socket.Connect(client);
+                socket = new UdpClient(new IPEndPoint(receivedOn, 0));
+                if ( client.Address.IsIPv4MappedToIPv6 )
+                {
+                    socket.Connect(client.Address.MapToIPv4(), client.Port);
+                }
+                else
+                {
+                    socket.Connect(client);
+                }
+                Log.Debug("connect: {local}->{remote}", socket.Client.LocalEndPoint, socket.Client.RemoteEndPoint);
+
 
                 var request = Parse.ParseRequest(requestBuf);
                 PrintRequest(client, request);
