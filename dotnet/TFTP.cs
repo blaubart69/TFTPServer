@@ -227,6 +227,7 @@ namespace TFTPServer
             }
             catch (FileNotFoundException)
             {
+                Log.Information("File not found: {filenotfound}", request.filename);
                 await socket.SendAsync(CreateError("File not found", 2));
             }
         }
@@ -244,37 +245,42 @@ namespace TFTPServer
                 }
                 else
                 {
-                    ReadOnlyMemory<byte> answer = receiveTask.Buffer.AsMemory<byte>();
-                    OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
-
-                    if (opcode == OPCODE.ERROR)
-                    {
-                        (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
-                        Log.Error("received error from client. code: {code}, message: {message}");
-                    }
-                    else if ( opcode != OPCODE.ACK )
-                    {
-                        Log.Error("expected: ACK for block {blockNumber} or ERROR. got {hexBytes}", expectedBlocknumber, bytesToHex(receiveTask.Buffer));
-                    }
-                    else 
-                    {
-                        UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
-                        if ( ackForBlock != expectedBlocknumber ) 
-                        {
-                            Log.Error("expected: ACK for block {blockNumber}. received ACK for block {ackForBlock}.", expectedBlocknumber, ackForBlock);
-                        }
-                        else
-                        {
-                            Log.Debug("received ACK for block {expectedBlocknumber}", expectedBlocknumber);
-                            // finally!
-                            return true;
-                        }
-                    }
+                    return HandleClientAnswer(receiveTask.Buffer.AsMemory<byte>(), expectedBlocknumber);
                 }
             }
             catch (TimeoutException)
             {
                 Log.Error("did not receive ACK for block {blockNumber} within {timeoutForACK}", expectedBlocknumber, timeoutForACK);
+            }
+
+            return false;
+        }
+        static bool HandleClientAnswer(ReadOnlyMemory<byte> answer, UInt16 expectedBlocknumber)
+        {
+            OPCODE opcode = (OPCODE)Parse.ReadUInt16BigEndian(answer.Slice(0,2));
+
+            if (opcode == OPCODE.ERROR)
+            {
+                (UInt16 code, string? message) = Parse.ParseError(answer.Slice(2));
+                Log.Error("received error from client. code: {code}, message: {message}");
+            }
+            else if ( opcode != OPCODE.ACK )
+            {
+                Log.Error("expected: ACK for block {blockNumber} or ERROR. got {hexBytes}", expectedBlocknumber, bytesToHex(answer.ToArray()));
+            }
+            else 
+            {
+                UInt16 ackForBlock = Parse.ReadUInt16BigEndian(answer.Slice(2, 2));
+                if ( ackForBlock != expectedBlocknumber ) 
+                {
+                    Log.Error("expected: ACK for block {blockNumber}. received ACK for block {ackForBlock}.", expectedBlocknumber, ackForBlock);
+                }
+                else
+                {
+                    Log.Debug("received ACK for block {expectedBlocknumber}", expectedBlocknumber);
+                    // finally!
+                    return true;
+                }
             }
 
             return false;

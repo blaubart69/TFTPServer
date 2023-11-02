@@ -7,7 +7,7 @@ namespace TFTPServer
         static void Main(string[] args)
         {   
             Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Debug()
+                .MinimumLevel.Error()
                 .WriteTo.Console()
                 .CreateLogger();
 
