@@ -1,0 +1,10 @@
+[unstable]
+mtime-on-use = true
+build-std = ["panic_abort", "std", "core", "alloc"]
+build-std-features = ["panic_immediate_abort"]
+
+[target.mips-unknown-linux-musl]
+# this is pointing to the linker from the OpenWRT SDK
+linker = "mips-openwrt-linux-gcc"
+
+

@@ -1,0 +1,9 @@
+install/unpack openwrt sdk
+
+export PATH=$PATH:~/openwrt/staging_dir/toolchain-xxxxxxxxxxxxxxxxxxxxxxx/bin/
+export STAGING_DIR=~/openwrt/staging_dir/
+
+cargo build --release --target mips-unknown-linux-musl
+
+host machine:
+cargo +nightly build --release --target x86_64-unknown-linux-gnu

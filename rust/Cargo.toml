@@ -8,3 +8,14 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = { version = "0.3" }
+
+[profile.release]
+panic = 'abort'
+
+[profile.minsize]
+inherits = "release"
+strip = true
+opt-level = "z"
+panic = 'abort'
+lto = true
+codegen-units = 1
