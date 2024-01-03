@@ -167,8 +167,8 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
         }
     }
 }
-
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")] // single-threaded - gives minus 30kB binary
+//#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
 
