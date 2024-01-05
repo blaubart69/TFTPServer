@@ -15,6 +15,28 @@ use tokio::io::AsyncReadExt;
     5     Error (ERROR)
     6     Option Acknowledgment (OACK)
 */
+/*
+enum OPCODE
+{
+    RRQ   = 1,
+    WRQ   = 2,
+    DATA  = 3,
+    ACK   = 4,
+    ERROR = 5,
+    OACK  = 6
+}*/
+
+#[non_exhaustive]
+struct OpCode;
+
+impl OpCode {
+    pub const READ  : u16 = 1;
+    pub const WRITE : u16 = 2; 
+    pub const DATA  : u16 = 3;
+    pub const ACK   : u16 = 4;
+    pub const ERROR : u16 = 5;
+    pub const OACK  : u16 = 6;
+}
 
 // len
 // 2 ... bytes opcode
@@ -27,9 +49,9 @@ use tokio::io::AsyncReadExt;
 //
 
 struct Options {
-    pub tsize   : Option<usize>,
-    pub timeout : Option<usize>,
-    pub blksize : Option<usize>
+    tsize   : Option<usize>,
+    timeout : Option<usize>,
+    blksize : Option<usize>
 }
 
 fn fmt_option(option : &Option<usize>) -> String {
@@ -46,63 +68,42 @@ impl std::fmt::Display for Options {
     }
 }
 
-struct Request<'a> {
-    opcode: u16,
-    filename: &'a str,
-    mode: &'a str,
-    options : Option<Options>
+impl Options {
+    fn any_option_given(&self) -> bool {
+        let empty = Options::empty();
+
+        ! (    
+               self.blksize.eq( &empty.blksize )
+            && self.tsize.eq  ( &empty.tsize )
+            && self.timeout.eq( &empty.timeout )
+        )
+    }
+
+    fn empty() -> Options {
+        Options {
+            blksize : None,
+            tsize : None,
+            timeout : None
+        }
+    }
 }
 
-impl std::fmt::Display for Request<'_> {
+struct Request {
+    opcode: u16,
+    filename: String,
+    //mode: &'a str,
+    options : Options
+}
+
+impl std::fmt::Display for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 
-        let opts = {
-            if self.options.is_none() {
-                &Options {
-                        blksize : None,
-                        tsize : None,
-                        timeout : None
-                    }
-            }
-            else {
-                &self.options.as_ref().unwrap()
-            }
-        };
-
-        write!(f,"opcode: {}, mode: {}, filename: {}, options [{}]", 
+        write!(f,"opcode: {}, mode: octet, filename: {}, options [{}]", 
             self.opcode
-            , self.mode
             , self.filename
-            , opts)
+            , self.options)
     }
 }
-
-impl<'a> Request<'a> {
-    fn set_option(&mut self, name : &str, value : usize) {
-        
-        let opts = {
-            if self.options.is_none() {
-                self.options = Some(
-                    Options {
-                        blksize : None,
-                        tsize : None,
-                        timeout : None
-                    }
-                );
-            };
-            self.options.as_mut().unwrap()
-        };
-
-        match name {            
-            "blksize"   => opts.blksize = Some(value),
-            "tsize"     => opts.tsize   = Some(value),
-            "timeout"   => opts.timeout = Some(value),
-            _ => eprintln!("unkown option {} with value {}", name, value)
-        }
-
-    }
-}
-
 
 #[derive(Error,Debug)]
 enum RequestParseError {
@@ -157,18 +158,18 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
 
     let mut elems = buf[2..buf.len() - 1].split(|&c| c == 0);
 
-    let filename = from_bytes(elems.next(), "filename")?;
+    let filename = from_bytes(elems.next(), "filename")?.to_owned();
     let mode = from_bytes(elems.next(), "mode")?;
 
-    if ! ["octet","mail", "netascii"].contains(&mode) {
+    //if ! ["octet","mail", "netascii"].contains(&mode) {
+    if ! ["octet"].contains(&mode) {
         return Err(RequestParseError::Invalid(format!("unsupported mode {}", mode).to_owned()));
     }
 
     let mut req = Request {
         opcode,
         filename,
-        mode,
-        options : None
+        options : Options::empty()
     };
 
     loop {
@@ -191,7 +192,14 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
                         match value_str.parse::<usize>() {
                             Err(e) => 
                                 return Err(RequestParseError::Invalid(format!("error converting {} to a number. option: {}, error {}", value_str, option_name, e).to_owned())),
-                            Ok(value) => req.set_option(option_name, value)
+                            Ok(value) => {
+                                match option_name {            
+                                    "blksize"   => req.options.blksize = Some(value),
+                                    "tsize"     => req.options.tsize   = Some(value),
+                                    "timeout"   => req.options.timeout = Some(value),
+                                    _ => eprintln!("unkown option {} with value {}", option_name, value)
+                                }
+                            }
                         }
                     }
                 }
@@ -203,19 +211,31 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
     
 }
 
-async fn handle_request(reqlen: usize, buf: Vec<u8>, from: SocketAddr) -> Result<(),Box<dyn Error>> {
-    let reqbytes = &buf[0..reqlen];
-    let req = parse_request(reqbytes)?;
+async fn create_oack(mut buf: &mut Vec<u8>, opts : &Options, filename : &str) -> Result<(),std::io::Error> {
+    buf.clear();
+    Ok(())
+}
+
+async fn handle_request(reqlen: usize, mut buf: Vec<u8>, from: SocketAddr) -> Result<(),Box<dyn Error>> {
+
+    let req = {
+        let reqbytes = &buf[0..reqlen];
+        parse_request(reqbytes)?
+    };
 
     println!("{} - {}", from, req);
     
     let file_reader = tokio::fs::File::options()
         .read(true)
-        .open(req.filename)
+        .open(req.filename.as_str())
         .await?;
 
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(from).await?;
+
+    if req.options.any_option_given() {
+        create_oack(&mut buf, &req.options, req.filename.as_str() ).await?;
+    }
 
     Ok(())
 }
