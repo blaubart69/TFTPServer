@@ -8,6 +8,10 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = { version = "0.3" }
+thiserror = "1.0.56"
+
+[profile.dev]
+panic = 'abort'
 
 [profile.release]
 panic = 'abort'

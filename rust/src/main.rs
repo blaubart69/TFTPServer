@@ -1,9 +1,10 @@
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{SocketAddr};
 use std::str::Utf8Error;
 use std::{env, io};
 
-use tokio::net::UdpSocket;
+use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 /*
     opcode  operation
@@ -25,37 +26,118 @@ use tokio::net::UdpSocket;
 // 9 ... minimal length of message
 //
 
+struct Options {
+    pub tsize   : Option<usize>,
+    pub timeout : Option<usize>,
+    pub blksize : Option<usize>
+}
+
+fn fmt_option(option : &Option<usize>) -> String {
+    option.map_or("None".to_owned(), |val| val.to_string())
+}
+
+impl std::fmt::Display for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"blksize: {}, tsize: {}, timeout: {}"
+            , fmt_option(&self.blksize)
+            , fmt_option(&self.tsize)
+            , fmt_option(&self.timeout)
+            )
+    }
+}
+
 struct Request<'a> {
     opcode: u16,
     filename: &'a str,
     mode: &'a str,
-    tsize : Option<usize>,
-    timeout : Option<usize>,
-    blksize : Option<usize>
+    options : Option<Options>
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for Request<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+
+        let opts = {
+            if self.options.is_none() {
+                &Options {
+                        blksize : None,
+                        tsize : None,
+                        timeout : None
+                    }
+            }
+            else {
+                &self.options.as_ref().unwrap()
+            }
+        };
+
+        write!(f,"opcode: {}, mode: {}, filename: {}, options [{}]", 
+            self.opcode
+            , self.mode
+            , self.filename
+            , opts)
+    }
+}
+
+impl<'a> Request<'a> {
+    fn set_option(&mut self, name : &str, value : usize) {
+        
+        let opts = {
+            if self.options.is_none() {
+                self.options = Some(
+                    Options {
+                        blksize : None,
+                        tsize : None,
+                        timeout : None
+                    }
+                );
+            };
+            self.options.as_mut().unwrap()
+        };
+
+        match name {            
+            "blksize"   => opts.blksize = Some(value),
+            "tsize"     => opts.tsize   = Some(value),
+            "timeout"   => opts.timeout = Some(value),
+            _ => eprintln!("unkown option {} with value {}", name, value)
+        }
+
+    }
+}
+
+
+#[derive(Error,Debug)]
 enum RequestParseError {
+    #[error("invalid option: {0}")]
     Invalid(String),
+
+    #[error("empty option: {0}")]
     Empty(&'static str),
-    FromStrError(&'static str, Utf8Error),
+
+    #[error("cannot convert option to UTF8. context: {context}, err: {utf8_error}")]
+    FromStrError {
+        context : &'static str, 
+        utf8_error : Utf8Error
+    }
 }
 
 fn from_bytes<'a>(
     buf: Option<&'a [u8]>,
     context: &'static str,
 ) -> Result<&'a str, RequestParseError> {
-    let bytes = buf.ok_or(RequestParseError::Empty(context))?;
+    let bytes = 
+        buf.ok_or(RequestParseError::Empty(context))?;
     
     let utf8string =
-        std::str::from_utf8(bytes).map_err(|e| RequestParseError::FromStrError(context, e))?;
+        std::str::from_utf8(bytes)
+        .map_err(|utf8_error| 
+            RequestParseError::FromStrError { context, utf8_error } )?;
 
-    println!("D: bytes {:?}, str: {}", bytes, utf8string);
+    //println!("D: bytes {:?}, str: {}", bytes, utf8string);
 
     Ok(utf8string)
 }
 
 fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
+
     if buf.len() < 9 {
         return Err(RequestParseError::Invalid(format!(
             "request too small. len={}. must be at least 9 bytes", buf.len()).to_owned()));
@@ -86,9 +168,7 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
         opcode,
         filename,
         mode,
-        tsize: None,
-        timeout: None,
-        blksize : None
+        options : None
     };
 
     loop {
@@ -98,26 +178,20 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
                     RequestParseError::Empty(_) => break,
                     _ => return Err(e)
                 },
-            Ok(key) => {
+            Ok(option_name) => {
 
                 match from_bytes(elems.next(), "options/value")  {
                     Err(e) =>
                         match e {
                             RequestParseError::Empty(_) => 
-                                return Err(RequestParseError::Invalid(format!("option {} has no value set", key).to_owned())),
+                                return Err(RequestParseError::Invalid(format!("option {} has no value set", option_name).to_owned())),
                             _ => return Err(e)
                         },
                     Ok(value_str) => {
                         match value_str.parse::<usize>() {
                             Err(e) => 
-                                return Err(RequestParseError::Invalid(format!("error converting {} to a number. option: {}", value_str, key).to_owned())),
-                            Ok(value) => 
-                                match key {            
-                                    "blksize" => req.blksize = Some(value),
-                                    "tsize" => req.tsize = Some(value),
-                                    "timeout" => req.timeout = Some(value),
-                                    _ => eprintln!("unkown option {} with value {}", key, value_str)
-                                }
+                                return Err(RequestParseError::Invalid(format!("error converting {} to a number. option: {}, error {}", value_str, option_name, e).to_owned())),
+                            Ok(value) => req.set_option(option_name, value)
                         }
                     }
                 }
@@ -129,23 +203,26 @@ fn parse_request(buf: &[u8]) -> Result<Request, RequestParseError> {
     
 }
 
-async fn handle_request(reqlen: usize, buf: Vec<u8>, from: SocketAddr) {
-    println!("request from {} with len {}", from, reqlen);
+async fn handle_request(reqlen: usize, buf: Vec<u8>, from: SocketAddr) -> Result<(),Box<dyn Error>> {
     let reqbytes = &buf[0..reqlen];
+    let req = parse_request(reqbytes)?;
 
-    let req = parse_request(reqbytes);
+    println!("{} - {}", from, req);
+    
+    let file_reader = tokio::fs::File::options()
+        .read(true)
+        .open(req.filename)
+        .await?;
 
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Err(e) => {
-            eprintln!("handle_request(bind): {}", e);
-            return;
-        }
-        Ok(s) => s,
-    };
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(from).await?;
 
-    if let Err(e) = socket.connect(from).await {
-        eprintln!("handle_request(connect): {}", e);
-        return;
+    Ok(())
+}
+
+async fn main_request(buflen: usize, buf: Vec<u8>, from: SocketAddr) {
+    if let Err(e) = handle_request(buflen, buf, from).await {
+        eprintln!("E: req from {} resulted in {}", from, e);
     }
 }
 
@@ -155,21 +232,19 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
     println!("listening: {}", sock69.local_addr()?);
 
     loop {
-        //let (datalen, from) = sock69.recv_from(&mut buf[..]).await?;
-
         let mut buf: Vec<u8> = vec![0; 1024];
 
         match sock69.recv_from(&mut buf[..]).await {
             Err(e) => eprintln!("{}", e),
             Ok((buflen, from)) => {
-                tokio::spawn(handle_request(buflen, buf, from));
+                tokio::spawn( main_request(buflen, buf, from) );
             }
         }
     }
 }
 #[tokio::main(flavor = "current_thread")] // single-threaded - gives minus 30kB binary
 //#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
 
     let ip = str_ip.parse()?;
