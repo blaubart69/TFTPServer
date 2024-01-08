@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::net::{SocketAddr};
+use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
 use std::str::Utf8Error;
 use std::time::Duration;
 use std::{env, io};
@@ -7,6 +7,7 @@ use std::{env, io};
 use tokio::io::AsyncReadExt;
 
 use thiserror::Error;
+use tokio::time::error::Elapsed;
 
 /*
     opcode  operation
@@ -367,8 +368,15 @@ async fn handle_request(reqlen: usize, mut buf: Vec<u8>, socket: tokio::net::Udp
 
 async fn main_request(buflen: usize, buf: Vec<u8>, from: SocketAddr) {
 
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Err(e) => { 
+    let ip = if from.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    }
+    else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    
+    let socket = match tokio::net::UdpSocket::bind(std::net::SocketAddr::new(ip,0)).await {
+        Err(e) => {
             eprintln!("bind failed. {}", e);
             return;
         },
@@ -376,7 +384,7 @@ async fn main_request(buflen: usize, buf: Vec<u8>, from: SocketAddr) {
     };
 
     if let Err(e) = socket.connect(from).await {
-        eprintln!("connect failed. {}", e);
+        eprintln!("connect to {} failed: {}", from, e);
         return;
     }
 
@@ -404,7 +412,8 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
 #[tokio::main(flavor = "current_thread")] // single-threaded - gives minus 30kB binary
 //#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
+    //let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
+    let str_ip = env::args().nth(1).unwrap_or_else(|| Ipv6Addr::UNSPECIFIED.to_string());
 
     let ip = str_ip.parse()?;
 
