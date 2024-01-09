@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
+use std::ops::Deref;
 use std::str::Utf8Error;
 use std::time::Duration;
 use std::{env, io};
+use std::io::Write;
 
 use tokio::io::AsyncReadExt;
 
 use thiserror::Error;
-use tokio::time::error::Elapsed;
 
 /*
     opcode  operation
@@ -144,6 +145,7 @@ fn from_bytes<'a>(
     buf: Option<&'a [u8]>,
     context: &'static str,
 ) -> Result<&'a str, ParseError> {
+
     let bytes = 
         buf.ok_or(ParseError::Empty(context))?;
     
@@ -156,6 +158,48 @@ fn from_bytes<'a>(
 
     Ok(utf8string)
 }
+
+fn parse_options<'a,I>(elems : &mut I) -> Result<Options, ParseError>
+where  I : Iterator<Item=&'a [u8]>   {
+
+    let mut options = Options::empty();
+
+    loop {
+        match from_bytes(elems.next(), "options/key") {
+            Err(e) =>
+                match e {
+                    ParseError::Empty(_) => break,
+                    _ => return Err(e)
+                },
+            Ok(option_name) => {
+
+                match from_bytes(elems.next(), "options/value")  {
+                    Err(e) =>
+                        match e {
+                            ParseError::Empty(_) => 
+                                return Err(ParseError::Invalid(format!("option {} has no value set", option_name).to_owned())),
+                            _ => return Err(e)
+                        },
+                    Ok(value_str) => {
+                        match value_str.parse::<usize>() {
+                            Err(e) => 
+                                return Err(ParseError::Invalid(format!("error converting {} to a number. option: {}, error {}", value_str, option_name, e).to_owned())),
+                            Ok(value) => {
+                                match option_name {            
+                                    "blksize"   => options.blksize = Some(value),
+                                    "tsize"     => options.tsize   = Some(value),
+                                    "timeout"   => options.timeout = Some(value),
+                                    _ => eprintln!("unkown option {} with value {}", option_name, value)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }   
+    }
+    Ok(options)
+} 
 
 fn parse_request(buf: &[u8]) -> Result<Request, ParseError> {
 
@@ -183,51 +227,14 @@ fn parse_request(buf: &[u8]) -> Result<Request, ParseError> {
 
     //if ! ["octet","mail", "netascii"].contains(&mode) {
     if ! ["octet"].contains(&mode) {
-        return Err(ParseError::Invalid(format!("unsupported mode {}", mode).to_owned()));
+        return Err(ParseError::Invalid(format!("unsupported mode [{}]. right now this server only supports [octet] mode", mode).to_owned()));
     }
 
-    let mut req = Request {
+    Ok( Request {
         opcode,
         filename,
-        options : Options::empty()
-    };
-
-    loop {
-        match from_bytes(elems.next(), "options/key") {
-            Err(e) =>
-                match e {
-                    ParseError::Empty(_) => break,
-                    _ => return Err(e)
-                },
-            Ok(option_name) => {
-
-                match from_bytes(elems.next(), "options/value")  {
-                    Err(e) =>
-                        match e {
-                            ParseError::Empty(_) => 
-                                return Err(ParseError::Invalid(format!("option {} has no value set", option_name).to_owned())),
-                            _ => return Err(e)
-                        },
-                    Ok(value_str) => {
-                        match value_str.parse::<usize>() {
-                            Err(e) => 
-                                return Err(ParseError::Invalid(format!("error converting {} to a number. option: {}, error {}", value_str, option_name, e).to_owned())),
-                            Ok(value) => {
-                                match option_name {            
-                                    "blksize"   => req.options.blksize = Some(value),
-                                    "tsize"     => req.options.tsize   = Some(value),
-                                    "timeout"   => req.options.timeout = Some(value),
-                                    _ => eprintln!("unkown option {} with value {}", option_name, value)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }   
-    }
-
-    Ok(req)
+        options : parse_options(&mut elems)?
+    })
     
 }
 
@@ -249,18 +256,27 @@ fn parse_error(buf : &[u8]) -> Result<(u16,String),ParseError> {
         Ok((code,message))
     }
 }
-async fn create_oack(mut buf: &mut Vec<u8>, opts : &Options, filename : &str) -> Result<(),Box<dyn Error>> {
+
+fn create_error(buf: &mut Vec<u8>, code : u16, message : &str) -> std::io::Result<()> {
+    buf.clear();
+    buf.extend_from_slice(OpCode::ERROR.to_be_bytes().as_ref());
+    buf.extend_from_slice(code.to_be_bytes().as_ref());
+    write!(buf, "{}\0", message)?;
+    Ok(())
+}
+
+async fn create_oack(buf: &mut Vec<u8>, opts : &Options, filename : &str) -> Result<(),Box<dyn Error>> {
     buf.clear();
     
     buf.extend_from_slice(OpCode::OACK.to_be_bytes().as_ref());
 
-    use std::io::Write;
+    
 
     if let Some(blksize) = opts.blksize {
         write!(buf,"blksize\0{}\0", blksize)?;    
     }
 
-    if let Some(tsize) = opts.tsize {
+    if let Some(_tsize) = opts.tsize {
         let meta = tokio::fs::metadata(filename).await?;
         write!(buf,"tsize\0{}\0", meta.len())?;    
     }
@@ -328,7 +344,7 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
     
 }
 
-async fn handle_request(reqlen: usize, mut buf: Vec<u8>, socket: tokio::net::UdpSocket) -> Result<(),Box<dyn Error>> {
+async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket) -> Result<(),Box<dyn Error>> {
 
     let req = {
         let reqbytes = &buf[0..reqlen];
@@ -366,7 +382,7 @@ async fn handle_request(reqlen: usize, mut buf: Vec<u8>, socket: tokio::net::Udp
     Ok(())
 }
 
-async fn main_request(buflen: usize, buf: Vec<u8>, from: SocketAddr) {
+async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
 
     let ip = if from.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -388,8 +404,16 @@ async fn main_request(buflen: usize, buf: Vec<u8>, from: SocketAddr) {
         return;
     }
 
-    if let Err(e) = handle_request(buflen, buf, socket).await {
-        eprintln!("req from {} resulted in {}", from, e);
+    let handle_result = handle_request(buflen, &mut buf, &socket).await.map_err(|e| e.to_string() );
+
+    if let Err(transfer_err) = handle_result {
+        eprintln!("{} - E: {}", from, transfer_err);
+        if let Err(e) = create_error(&mut buf, 99, transfer_err.as_str()) {
+            eprintln!("{} - E: could not create error packet for client. [{}]", from, e);
+        } 
+        else if let Err(ioerr) = socket.send(buf.as_slice()).await {
+            eprintln!("{} - E: could not send error message to client. [{}]", from, ioerr);
+        }
     }
 }
 
