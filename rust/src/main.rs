@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
-use std::ops::Deref;
 use std::str::Utf8Error;
 use std::time::Duration;
 use std::{env, io};
@@ -51,7 +50,7 @@ impl OpCode {
 // ----------
 // 9 ... minimal length of message
 //
-
+#[derive(PartialEq)]
 struct Options {
     tsize   : Option<usize>,
     timeout : Option<usize>,
@@ -74,13 +73,7 @@ impl std::fmt::Display for Options {
 
 impl Options {
     fn any_option_given(&self) -> bool {
-        let empty = Options::empty();
-
-        ! (    
-               self.blksize.eq( &empty.blksize )
-            && self.tsize.eq  ( &empty.tsize )
-            && self.timeout.eq( &empty.timeout )
-        )
+        Options::empty().ne(self)
     }
 
     fn empty() -> Options {
