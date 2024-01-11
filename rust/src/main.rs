@@ -122,17 +122,16 @@ enum ParseError {
 enum TransferError {
     #[error("client answer is too small. only {0} bytes")]
     AnswerTooSmall(usize),
-    #[error("client sent error. code {0} message {1}")]
-    ClientError(u16,String),
     #[error("unexpected answer from client. expected was: {0}")]
     Unexpected(String),
     #[error("unexpected ACK for block {got}. expected: {expected}")]
     UnexpectedBlock {
         got: u16,
         expected: u16
-    }
+    },
+    #[error("client sent error. code {0}, message {1}")]
+    ClientError(u16,String)
 }
-
 
 fn from_bytes<'a>(
     buf: Option<&'a [u8]>,
@@ -143,7 +142,7 @@ fn from_bytes<'a>(
         buf.ok_or(ParseError::Empty(context))?;
     
     let utf8string =
-        std::str::from_utf8(bytes)
+        std::str::from_utf8 (bytes)
         .map_err(|utf8_error| 
             ParseError::FromStrError { context, utf8_error } )?;
 
@@ -315,7 +314,7 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
             Err(TransferError::ClientError(code,message))?
         }
         else if client_opcode != OpCode::ACK {
-            Err(TransferError::Unexpected(format!("ACK or ERR")))?
+            Err(TransferError::Unexpected("ACK or ERR".to_owned()))?
         }
         else {
             /*
@@ -397,11 +396,28 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
         return;
     }
 
-    let handle_result = handle_request(buflen, &mut buf, &socket).await.map_err(|e| e.to_string() );
+    //let handle_result = handle_request(buflen, &mut buf, &socket).await.map_err(|e| e.to_string() );
+    let transfer_err = match handle_request(buflen, &mut buf, &socket).await {
+        Err(e) => {
+            if let Some(te) = e.downcast_ref::<TransferError>() {
+                match te {
+                    TransferError::ClientError(code,message) => {
+                        println!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message);
+                        None
+                    },
+                    _ => Some(te.to_string())
+                }
+            }
+            else {
+                Some(e.to_string())
+            }
+        },
+        Ok(()) => None
+    };
 
-    if let Err(transfer_err) = handle_result {
-        eprintln!("{} - E: {}", from, transfer_err);
-        if let Err(e) = create_error(&mut buf, 99, transfer_err.as_str()) {
+    if let Some(e) = transfer_err {
+        eprintln!("{} - E: {}", from, e);
+        if let Err(e) = create_error(&mut buf, 99, e.as_str()) {
             eprintln!("{} - E: could not create error packet for client. [{}]", from, e);
         } 
         else if let Err(ioerr) = socket.send(buf.as_slice()).await {
