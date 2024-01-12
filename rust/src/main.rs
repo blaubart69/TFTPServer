@@ -9,26 +9,6 @@ use tokio::io::AsyncReadExt;
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 
-/*
-    opcode  operation
-    1     Read request (RRQ)
-    2     Write request (WRQ)
-    3     Data (DATA)
-    4     Acknowledgment (ACK)
-    5     Error (ERROR)
-    6     Option Acknowledgment (OACK)
-*/
-/*
-enum OPCODE
-{
-    RRQ   = 1,
-    WRQ   = 2,
-    DATA  = 3,
-    ACK   = 4,
-    ERROR = 5,
-    OACK  = 6
-}*/
-
 #[non_exhaustive]
 struct OpCode;
 
@@ -416,7 +396,6 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
         match tftp_err {
             TftpError::ClientSentErr{code,message} =>
                 println!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message),
-
             other_err => {
                 eprintln!("{} - E: {}", from, other_err);
                 if let Err(e) = create_error(&mut buf, 99, other_err) {
