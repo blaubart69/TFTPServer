@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
 use std::str::Utf8Error;
 use std::time::Duration;
@@ -8,6 +7,7 @@ use std::io::Write;
 use tokio::io::AsyncReadExt;
 
 use thiserror::Error;
+use tokio::time::error::Elapsed;
 
 /*
     opcode  operation
@@ -119,7 +119,7 @@ enum ParseError {
 }
 
 #[derive(Error,Debug)]
-enum TransferError {
+enum ProtocolError {
     #[error("client answer is too small. only {0} bytes")]
     AnswerTooSmall(usize),
     #[error("unexpected answer from client. expected was: {0}")]
@@ -129,8 +129,23 @@ enum TransferError {
         got: u16,
         expected: u16
     },
-    #[error("client sent error. code {0}, message {1}")]
-    ClientError(u16,String)
+    #[error("client did not answer within {0} seconds")]
+    Timeout(u64)
+}
+
+#[derive(Error,Debug)]
+enum TftpError {
+    #[error("parsing: {0}")]
+    ParseErr(#[from] ParseError),
+    #[error("protocol: {0}")]
+    ProtocolErr(#[from] ProtocolError),
+    #[error("client sent error. code {code} message {message}")]
+    ClientSentErr {
+        code: u16,
+        message : String
+    },
+    #[error("IO error: {0}")]
+    IOErr(#[from] std::io::Error)
 }
 
 fn from_bytes<'a>(
@@ -206,9 +221,9 @@ fn parse_request(buf: &[u8]) -> Result<Request, ParseError> {
     }
 
     let opcode = u16::from_be_bytes([buf[0], buf[1]]);
-    if opcode != 1 {
+    if opcode != OpCode::READ {
         return Err(ParseError::Invalid(format!(
-            "only READ REQ is supported. bytes given: {:#X} {:#X} resulted in opcode (u16) {:#X}", 
+            "only READ is supported. bytes given: {:#X} {:#X} resulted in opcode (u16) {:#X}", 
             buf[0], buf[1], opcode).to_owned()));
     }
 
@@ -217,7 +232,6 @@ fn parse_request(buf: &[u8]) -> Result<Request, ParseError> {
     let filename = from_bytes(elems.next(), "filename")?.to_owned();
     let mode = from_bytes(elems.next(), "mode")?;
 
-    //if ! ["octet","mail", "netascii"].contains(&mode) {
     if ! ["octet"].contains(&mode) {
         return Err(ParseError::Invalid(format!("unsupported mode [{}]. right now this server only supports [octet] mode", mode).to_owned()));
     }
@@ -249,7 +263,7 @@ fn parse_error(buf : &[u8]) -> Result<(u16,String),ParseError> {
     }
 }
 
-fn create_error(buf: &mut Vec<u8>, code : u16, message : &str) -> std::io::Result<()> {
+fn create_error(buf: &mut Vec<u8>, code : u16, message : impl std::fmt::Display) -> std::io::Result<()> {
     buf.clear();
     buf.extend_from_slice(OpCode::ERROR.to_be_bytes().as_ref());
     buf.extend_from_slice(code.to_be_bytes().as_ref());
@@ -257,12 +271,10 @@ fn create_error(buf: &mut Vec<u8>, code : u16, message : &str) -> std::io::Resul
     Ok(())
 }
 
-async fn create_oack(buf: &mut Vec<u8>, opts : &Options, filename : &str) -> Result<(),Box<dyn Error>> {
+async fn create_oack(buf: &mut Vec<u8>, opts : &Options, filename : &str) -> std::io::Result<()> {
     buf.clear();
     
     buf.extend_from_slice(OpCode::OACK.to_be_bytes().as_ref());
-
-    
 
     if let Some(blksize) = opts.blksize {
         write!(buf,"blksize\0{}\0", blksize)?;    
@@ -280,7 +292,7 @@ async fn create_oack(buf: &mut Vec<u8>, opts : &Options, filename : &str) -> Res
     Ok(())
 }
 
-async fn create_data(buf: &mut Vec<u8>, block_number : u16,  blocksize : usize, reader : &mut tokio::fs::File) -> Result<usize,io::Error> {
+async fn create_data(buf: &mut Vec<u8>, block_number : u16,  blocksize : usize, reader : &mut tokio::fs::File) -> std::io::Result<usize> {
     buf.clear();
     buf.extend_from_slice(OpCode::DATA.to_be_bytes().as_ref());
     buf.extend_from_slice(block_number.to_be_bytes().as_ref());
@@ -295,15 +307,18 @@ async fn create_data(buf: &mut Vec<u8>, block_number : u16,  blocksize : usize, 
     Ok(bytes_read)
 }
 
-async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16, socket: &tokio::net::UdpSocket) -> Result<(),Box<dyn Error>> {
+async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16, socket: &tokio::net::UdpSocket) -> Result<(),TftpError> {
+
     socket.send(buf.as_slice()).await?;
 
-    let bytes_received = tokio::time::timeout( 
-        Duration::from_secs(3)
-        , socket.recv(&mut buf[..])).await??;
+    let timeout = Duration::from_secs(3);
+
+    let bytes_received = 
+        tokio::time::timeout( timeout, socket.recv(&mut buf[..]) ).await
+            .map_err( |_elapsed: Elapsed| { ProtocolError::Timeout(timeout.as_secs()) })??;
 
     if bytes_received < 4 {
-        Err(TransferError::AnswerTooSmall(bytes_received))?
+        Err(ProtocolError::AnswerTooSmall(bytes_received))?
     }
     else        
     {
@@ -311,10 +326,10 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
         let client_opcode = u16::from_be_bytes([answer[0], answer[1]]);
         if client_opcode == OpCode::ERROR {
             let (code,message) = parse_error(&answer[2..])?;
-            Err(TransferError::ClientError(code,message))?
+            Err(TftpError::ClientSentErr{code,message})?
         }
         else if client_opcode != OpCode::ACK {
-            Err(TransferError::Unexpected("ACK or ERR".to_owned()))?
+            Err(ProtocolError::Unexpected("ACK or ERR".to_owned()))?
         }
         else {
             /*
@@ -325,7 +340,7 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
             */
             let ack_for_block = u16::from_be_bytes([answer[2], answer[3]]);
             if ack_for_block != expected_block_number {
-                Err(TransferError::UnexpectedBlock { got : ack_for_block, expected: expected_block_number })?
+                Err(ProtocolError::UnexpectedBlock { got : ack_for_block, expected: expected_block_number })?
             }
             else {
                 // FINALLY - a richtige Auntwurt!
@@ -336,7 +351,7 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
     
 }
 
-async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket) -> Result<(),Box<dyn Error>> {
+async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket) -> Result<(),TftpError> {
 
     let req = {
         let reqbytes = &buf[0..reqlen];
@@ -397,31 +412,20 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
     }
 
     //let handle_result = handle_request(buflen, &mut buf, &socket).await.map_err(|e| e.to_string() );
-    let transfer_err = match handle_request(buflen, &mut buf, &socket).await {
-        Err(e) => {
-            if let Some(te) = e.downcast_ref::<TransferError>() {
-                match te {
-                    TransferError::ClientError(code,message) => {
-                        println!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message);
-                        None
-                    },
-                    _ => Some(te.to_string())
+    if let Err(tftp_err) = handle_request(buflen, &mut buf, &socket).await {
+        match tftp_err {
+            TftpError::ClientSentErr{code,message} =>
+                println!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message),
+
+            other_err => {
+                eprintln!("{} - E: {}", from, other_err);
+                if let Err(e) = create_error(&mut buf, 99, other_err) {
+                    eprintln!("{} - E: could not create error packet for client. [{}]", from, e);
+                } 
+                else if let Err(ioerr) = socket.send(buf.as_slice()).await {
+                    eprintln!("{} - E: could not send error message to client. [{}]", from, ioerr);
                 }
             }
-            else {
-                Some(e.to_string())
-            }
-        },
-        Ok(()) => None
-    };
-
-    if let Some(e) = transfer_err {
-        eprintln!("{} - E: {}", from, e);
-        if let Err(e) = create_error(&mut buf, 99, e.as_str()) {
-            eprintln!("{} - E: could not create error packet for client. [{}]", from, e);
-        } 
-        else if let Err(ioerr) = socket.send(buf.as_slice()).await {
-            eprintln!("{} - E: could not send error message to client. [{}]", from, ioerr);
         }
     }
 }
