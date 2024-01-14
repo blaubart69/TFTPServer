@@ -484,15 +484,22 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn test_empty_options() {
+        let empty = Options::empty();
+        assert!( empty.any_option_given() == false );
+    }
     #[tokio::test]
     async fn test_create_oack() {
         let mut buf = Vec::<u8>::new();
 
-        create_oack(&mut buf, 
+        create_oack(
+            &mut buf, 
             &Options {
                   blksize : Some(1024)
                 , timeout : None
-                , tsize   : None }, "dummy").await.unwrap();
+                , tsize   : None }, 
+            "dummy").await.unwrap();
 
         assert!(buf.len() > 0);
         assert_eq!(OpCode::OACK, u16::from_be_bytes([buf[0], buf[1]]));
@@ -503,5 +510,6 @@ mod tests {
         assert_eq!("1024", from_bytes( elems.next(), "blksize value").unwrap());
         assert!( matches!( from_bytes(elems.next(), "end").unwrap_err(), ParseError::Empty(_)) );
     }
+
 
 }
