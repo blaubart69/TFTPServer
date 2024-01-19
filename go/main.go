@@ -46,7 +46,7 @@ func handleRequest(buf []byte, conn *net.UDPConn) error {
 	var blksize = 512
 	var blocknumber = 1
 	rdr := bufio.NewReader(f)
-	buf = buf[0 : 4+blksize]
+	buf = append(buf)
 
 	for {
 		buf = buf[0 : 4+blksize]
