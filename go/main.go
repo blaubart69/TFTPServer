@@ -24,58 +24,39 @@ func parseRequest(buf []byte) error {
 	return nil
 }
 
-func handleRequest(buf []byte, conn *net.UDPConn) error {
-
-	err := parseRequest(buf)
-	if err != nil {
-		return err
-	}
-
-	tokens := bytes.Split(buf[2:len(buf)-1], []byte{0})
-	filename := string(tokens[0])
-	mode := string(tokens[1])
-
-	fmt.Printf("filename [%s], mode [%s]\n", filename, mode)
-
-	f, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("cannot open file. err: %s", err)
-	}
-	defer f.Close()
-
+func sendFile(f *os.File, conn *net.UDPConn) error {
 	var blksize = 512
 	var blocknumber = 1
 	rdr := bufio.NewReader(f)
-	buf = append(buf)
+	data := make([]byte, 4+blksize)
 
 	for {
-		buf = buf[0 : 4+blksize]
-		binary.BigEndian.PutUint16(buf[0:2], 3)
-		binary.BigEndian.PutUint16(buf[2:4], uint16(blocknumber))
+		binary.BigEndian.PutUint16(data[0:2], 3)
+		binary.BigEndian.PutUint16(data[2:4], uint16(blocknumber))
 
-		fileBytesRead, err := rdr.Read(buf[4 : 4+blksize])
+		fileBytesRead, err := rdr.Read(data[4 : 4+blksize])
 		if err != nil {
-			return fmt.Errorf("reading from filename [%s]. err: [%s]", filename, err)
+			return fmt.Errorf("reading from filename [%s]. err: [%s]", f.Name(), err)
 		}
 
-		sentBytes, err := conn.Write(buf[0 : 4+fileBytesRead])
+		sentBytes, err := conn.Write(data[0 : 4+fileBytesRead])
 		if err != nil {
 			return fmt.Errorf("cannot write to client [%s]. err: [%s]", conn.RemoteAddr(), err)
 		}
 
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		socketBytesRead, err := conn.Read(buf)
+		socketBytesRead, err := conn.Read(data)
 		if err != nil {
 			return fmt.Errorf("client response: [%s]", err)
 		} else if socketBytesRead < 4 {
 			return fmt.Errorf("client response is only %d bytes long. should be 4.", socketBytesRead)
 		}
 
-		if answerOpcode := binary.BigEndian.Uint16(buf[0:2]); answerOpcode != 4 {
+		if answerOpcode := binary.BigEndian.Uint16(data[0:2]); answerOpcode != 4 {
 			return fmt.Errorf("client answered with opcode %d", answerOpcode)
 		}
 
-		if ackedBlocknumber := binary.BigEndian.Uint16(buf[2:4]); ackedBlocknumber != ackedBlocknumber {
+		if ackedBlocknumber := binary.BigEndian.Uint16(data[2:4]); ackedBlocknumber != ackedBlocknumber {
 			return fmt.Errorf("client ACKed block %d. but should be %d", ackedBlocknumber, blocknumber)
 		}
 
@@ -87,8 +68,29 @@ func handleRequest(buf []byte, conn *net.UDPConn) error {
 
 		blocknumber = blocknumber + 1
 	}
-
 	return nil
+}
+
+func handleRequest(request []byte, conn *net.UDPConn) error {
+
+	err := parseRequest(request)
+	if err != nil {
+		return err
+	}
+
+	tokens := bytes.Split(request[2:len(request)-1], []byte{0})
+	filename := string(tokens[0])
+	mode := string(tokens[1])
+
+	fmt.Printf("filename [%s], mode [%s]\n", filename, mode)
+
+	f, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("cannot open file. err: %s", err)
+	}
+	defer f.Close()
+
+	return sendFile(f, conn)
 }
 
 func mainRequest(buf []byte, client *net.UDPAddr) {
@@ -99,6 +101,8 @@ func mainRequest(buf []byte, client *net.UDPAddr) {
 	if err != nil {
 		fmt.Printf("could not create socket to client (%s). err: [%s]\n", client, err)
 	} else {
+		defer conn.Close()
+
 		err := handleRequest(buf, conn)
 		if err != nil {
 			fmt.Printf("error handling client (%s). err: [%s]\n", client, err)
