@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+type OpCode uint16
+
+const (
+	OpCodeREAD  OpCode = 1
+	OpCodeWRITE OpCode = 2
+	OpCodeDATA  OpCode = 3
+	OpCodeACK   OpCode = 4
+	OpCodeERROR OpCode = 5
+	OpCodeOACK  OpCode = 6
+)
+
 func parseRequest(buf []byte) error {
 	if len(buf) < 9 {
 		return fmt.Errorf("req is only %d bytes. minimun len 9", len(buf))
@@ -24,9 +35,32 @@ func parseRequest(buf []byte) error {
 	return nil
 }
 
+/*
+2 bytes     2 bytes      string    1 byte
+
+	-----------------------------------------
+
+| Opcode |  ErrorCode |   ErrMsg   |   0  |
+
+	-----------------------------------------
+	       Figure 5-4: ERROR packet
+*/
+func parseClientError(data []byte) (uint16, string) {
+	var clientErrCode = binary.BigEndian.Uint16(data[0:2])
+
+	var clientErrMessage string
+	if len(data) < 4 {
+		clientErrMessage = "packet does not contain valid error message"
+	} else {
+		clientErrMessage = string(data[2 : len(data)-1])
+	}
+
+	return clientErrCode, clientErrMessage
+}
+
 func sendFile(f *os.File, conn *net.UDPConn) error {
 	var blksize = 512
-	var blocknumber = 1
+	var blocknumber uint16 = 1
 	rdr := bufio.NewReader(f)
 	data := make([]byte, 4+blksize)
 
@@ -39,7 +73,7 @@ func sendFile(f *os.File, conn *net.UDPConn) error {
 			return fmt.Errorf("reading from filename [%s]. err: [%s]", f.Name(), err)
 		}
 
-		sentBytes, err := conn.Write(data[0 : 4+fileBytesRead])
+		_, err = conn.Write(data[0 : 4+fileBytesRead])
 		if err != nil {
 			return fmt.Errorf("cannot write to client [%s]. err: [%s]", conn.RemoteAddr(), err)
 		}
@@ -47,20 +81,19 @@ func sendFile(f *os.File, conn *net.UDPConn) error {
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		socketBytesRead, err := conn.Read(data)
 		if err != nil {
-			return fmt.Errorf("client response: [%s]", err)
+			return fmt.Errorf("read from socket: [%s]", err)
 		} else if socketBytesRead < 4 {
-			return fmt.Errorf("client response is only %d bytes long. should be 4.", socketBytesRead)
+			return fmt.Errorf("client response is only %d bytes long. should be 4 at least 4 (ACK).", socketBytesRead)
 		}
 
-		if answerOpcode := binary.BigEndian.Uint16(data[0:2]); answerOpcode != 4 {
-			return fmt.Errorf("client answered with opcode %d", answerOpcode)
-		}
-
-		if ackedBlocknumber := binary.BigEndian.Uint16(data[2:4]); ackedBlocknumber != ackedBlocknumber {
+		if answerOpcode := binary.BigEndian.Uint16(data[0:2]); OpCode(answerOpcode) == OpCodeERROR {
+			clientErrCode, clientErrMessage := parseClientError(data[2:socketBytesRead])
+			return fmt.Errorf("client interupted the transfer with OpCode ERROR (%d). code %d, message %s", answerOpcode, clientErrCode, clientErrMessage)
+		} else if OpCode(answerOpcode) != OpCodeACK {
+			return fmt.Errorf("unexpected opcode from client during transmission %d", answerOpcode)
+		} else if ackedBlocknumber := binary.BigEndian.Uint16(data[2:4]); ackedBlocknumber != blocknumber {
 			return fmt.Errorf("client ACKed block %d. but should be %d", ackedBlocknumber, blocknumber)
 		}
-
-		fmt.Printf("block: %d, sent %d bytes to %s\n", blocknumber, sentBytes, conn.RemoteAddr())
 
 		if fileBytesRead < blksize {
 			break
@@ -82,7 +115,7 @@ func handleRequest(request []byte, conn *net.UDPConn) error {
 	filename := string(tokens[0])
 	mode := string(tokens[1])
 
-	fmt.Printf("filename [%s], mode [%s]\n", filename, mode)
+	fmt.Printf("%s filename [%s], mode [%s]\n", conn.RemoteAddr(), filename, mode)
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -95,7 +128,7 @@ func handleRequest(request []byte, conn *net.UDPConn) error {
 
 func mainRequest(buf []byte, client *net.UDPAddr) {
 
-	fmt.Printf("> recv from: %s (%d bytes)\n", client.String(), len(buf))
+	//fmt.Printf("> recv from: %s (%d bytes)\n", client.String(), len(buf))
 
 	conn, err := net.DialUDP("udp", nil, client)
 	if err != nil {
@@ -105,7 +138,9 @@ func mainRequest(buf []byte, client *net.UDPAddr) {
 
 		err := handleRequest(buf, conn)
 		if err != nil {
-			fmt.Printf("error handling client (%s). err: [%s]\n", client, err)
+			fmt.Printf("%s error in transfer. err: [%s]\n", client, err)
+		} else {
+			fmt.Printf("%s transfer finished ok\n", client)
 		}
 	}
 }
