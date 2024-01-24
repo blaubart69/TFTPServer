@@ -1,3 +1,4 @@
 rust/copyToOpenwrt.sh
 go/pkg/mod/cache/lock
 go/tftpsrv.exe
+go/tftpsrv

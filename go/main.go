@@ -27,6 +27,30 @@ type Request struct {
 	file    *os.File
 	blksize uint64
 	timeout uint64
+	oack    []byte
+}
+
+// | Opcode (2 bytes) |  ErrorCode (2 bytes) |   ErrMsg   |   0  |
+func parseClientError(data []byte) (uint16, string) {
+	var clientErrCode = binary.BigEndian.Uint16(data[0:2])
+
+	var clientErrMessage string
+	if len(data) < 4 {
+		clientErrMessage = "packet does not contain valid error message"
+	} else {
+		clientErrMessage = string(data[2 : len(data)-1])
+	}
+
+	return clientErrCode, clientErrMessage
+}
+
+func createErrorPacket(errorCode uint16, msg string) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint16(buf[0:2], uint16(OpCodeERROR))
+	binary.BigEndian.PutUint16(buf[2:4], errorCode)
+	buf = fmt.Appendf(buf, msg)
+	buf = append(buf, 0)
+	return buf
 }
 
 func appendOption(buf []byte, key string, val uint64) []byte {
@@ -37,7 +61,7 @@ func appendOption(buf []byte, key string, val uint64) []byte {
 	return buf
 }
 
-func parseOptions(req *Request, tokens [][]byte) error {
+func parseOptions(req *Request, tokens [][]byte) ([]byte, error) {
 	var oack []byte
 
 	req.blksize = 512
@@ -47,7 +71,7 @@ func parseOptions(req *Request, tokens [][]byte) error {
 
 		uintval, err := strconv.ParseUint(string(tokens[i+1]), 10, 64)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		switch string(tokens[i]) {
@@ -57,7 +81,7 @@ func parseOptions(req *Request, tokens [][]byte) error {
 
 		case "tsize":
 			if info, err := req.file.Stat(); err != nil {
-				return fmt.Errorf("cannot stat() file %s. err: %s", req.file.Name(), err)
+				return nil, fmt.Errorf("cannot stat() file %s. err: %s", req.file.Name(), err)
 			} else {
 				oack = appendOption(oack, "tsize", uint64(info.Size()))
 			}
@@ -65,11 +89,11 @@ func parseOptions(req *Request, tokens [][]byte) error {
 			req.timeout = uintval
 			oack = appendOption(oack, "timeout", req.timeout)
 		default:
-			fmt.Errorf("unknown option [%s]", tokens[i])
+			_ = fmt.Errorf("unknown option [%s]", tokens[i])
 		}
 	}
 
-	return nil
+	return oack, nil
 }
 
 func parseFilenameMode(tokens [][]byte) (*Request, error) {
@@ -114,25 +138,13 @@ func parseRequest(buf []byte) (*Request, error) {
 		return nil, err
 	}
 
-	if err := parseOptions(req, tokens[2:]); err != nil {
+	if oack, err := parseOptions(req, tokens[2:]); err != nil {
 		return nil, err
+	} else {
+		req.oack = oack
 	}
 
 	return req, nil
-}
-
-// | Opcode (2 bytes) |  ErrorCode (2 bytes) |   ErrMsg   |   0  |
-func parseClientError(data []byte) (uint16, string) {
-	var clientErrCode = binary.BigEndian.Uint16(data[0:2])
-
-	var clientErrMessage string
-	if len(data) < 4 {
-		clientErrMessage = "packet does not contain valid error message"
-	} else {
-		clientErrMessage = string(data[2 : len(data)-1])
-	}
-
-	return clientErrCode, clientErrMessage
 }
 
 func sendBlockWaitForAck(data []byte, conn *net.UDPConn, blocknumber uint16) error {
@@ -146,7 +158,7 @@ func sendBlockWaitForAck(data []byte, conn *net.UDPConn, blocknumber uint16) err
 	if err != nil {
 		return fmt.Errorf("read from socket: [%s]", err)
 	} else if socketBytesRead < 4 {
-		return fmt.Errorf("client response is only %d bytes long. should be 4 at least 4 (ACK).", socketBytesRead)
+		return fmt.Errorf("client response is only %d bytes long. should be 4 at least 4 (ACK)", socketBytesRead)
 	}
 
 	if answerOpcode := binary.BigEndian.Uint16(data[0:2]); OpCode(answerOpcode) == OpCodeERROR {
@@ -161,26 +173,27 @@ func sendBlockWaitForAck(data []byte, conn *net.UDPConn, blocknumber uint16) err
 	return nil
 }
 
-func sendFile(f *os.File, conn *net.UDPConn) error {
-	var blksize = 512
-	var blocknumber uint16 = 1
-	rdr := bufio.NewReader(f)
-	data := make([]byte, 4+blksize)
+func sendFile(req *Request, conn *net.UDPConn) error {
 
+	rdr := bufio.NewReader(req.file)
+	data := make([]byte, 4+req.blksize)
+
+	var blocknumber uint16 = 1
 	for {
 		binary.BigEndian.PutUint16(data[0:2], 3)
 		binary.BigEndian.PutUint16(data[2:4], uint16(blocknumber))
 
-		fileBytesRead, err := rdr.Read(data[4 : 4+blksize])
+		fileBytesRead, err := rdr.Read(data[4 : 4+req.blksize])
 		if err != nil {
-			return fmt.Errorf("reading from filename [%s]. err: [%s]", f.Name(), err)
+			return fmt.Errorf("reading from filename [%s]. err: [%s]", req.file.Name(), err)
 		}
 
-		if err := sendBlockWaitForAck(data[0:4+fileBytesRead], conn, blocknumber); err != nil {
+		err = sendBlockWaitForAck(data[0:4+fileBytesRead], conn, blocknumber)
+		if err != nil {
 			return err
 		}
 
-		if fileBytesRead < blksize {
+		if fileBytesRead < int(req.blksize) {
 			break
 		}
 
@@ -198,8 +211,14 @@ func handleRequest(request []byte, conn *net.UDPConn) error {
 	defer req.file.Close()
 
 	fmt.Printf("%s filename [%s]\n", conn.RemoteAddr(), req.file.Name())
+	if req.oack != nil {
+		err = sendBlockWaitForAck(req.oack, conn, 0)
+		if err != nil {
+			return err
+		}
+	}
 
-	return sendFile(req.file, conn)
+	return sendFile(req, conn)
 }
 
 func mainRequest(buf []byte, client *net.UDPAddr) {
@@ -215,6 +234,7 @@ func mainRequest(buf []byte, client *net.UDPAddr) {
 		err := handleRequest(buf, conn)
 		if err != nil {
 			fmt.Printf("%s error in transfer. err: [%s]\n", client, err)
+			conn.Write(createErrorPacket(99, err.Error()))
 		} else {
 			fmt.Printf("%s transfer finished ok\n", client)
 		}
