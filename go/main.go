@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // blank import to pprof
 	"os"
 	"strconv"
 	"time"
@@ -242,6 +244,10 @@ func mainRequest(buf []byte, client *net.UDPAddr) {
 }
 
 func main() {
+
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
 
 	udpAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:6969")
 
