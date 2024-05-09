@@ -338,6 +338,20 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
     
 }
 
+fn printable_request(buf: &[u8]) -> String {
+    let mut str = String::new();
+    for &c in buf {
+        if c < 0x20 || c > 0x7e {
+            use std::fmt::Write;
+            write!(str, "\\x{:X}", c);
+        }
+        else {
+            str.push(c as char);
+        }
+    }
+    str
+}
+
 async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket) -> Result<(),TftpError> {
 
     let req = {
@@ -345,7 +359,7 @@ async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::ne
         parse_request(reqbytes)?
     };
 
-    log::info!("{} - {}", socket.peer_addr()?, req);
+    info!("{} - {} ({})", socket.peer_addr()?, req, printable_request(&buf[0..reqlen]));
     
     let mut file_reader = tokio::fs::File::options()
         .read(true)
@@ -375,6 +389,7 @@ async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::ne
 
     Ok(())
 }
+
 
 async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
 
@@ -522,6 +537,11 @@ mod tests {
         assert_eq!("1024", from_bytes( elems.next(), "blksize value").unwrap());
         assert!( matches!( from_bytes(elems.next(), "end").unwrap_err(), ParseError::Empty(_)) );
     }
-
+    #[test]
+    fn test_print_raw_request() {
+        let req  = [1u8, 2, 0x66, 0x69, 0x6C, 0x65, 0x6E, 0x61, 0x6D, 0x65, 0, 0x4D, 0x4F, 0x44, 0x45, 0];
+        let str_req = printable_request(&req);
+        assert_eq!("\\x1\\x2filename\\x0MODE\\x0".to_owned(), str_req);
+    }
 
 }
