@@ -9,6 +9,13 @@ use tokio::io::AsyncReadExt;
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 
+#[macro_use] extern crate log;
+//use simplelog::*;
+
+struct CmdOptions {
+    max_blksize : Option<usize>
+}
+
 #[non_exhaustive]
 struct OpCode;
 
@@ -338,7 +345,7 @@ async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::ne
         parse_request(reqbytes)?
     };
 
-    println!("{} - {}", socket.peer_addr()?, req);
+    log::info!("{} - {}", socket.peer_addr()?, req);
     
     let mut file_reader = tokio::fs::File::options()
         .read(true)
@@ -358,7 +365,7 @@ async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::ne
         send_block_wait_for_ack(&mut buf, block_number, &socket).await?;
 
         if bytes_read < blocksize {
-            println!("{} - finished transfer of file {}", socket.peer_addr()?, req.filename);
+            info!("{} - finished transfer of file {}", socket.peer_addr()?, req.filename);
             break;
         }
         else {
@@ -380,14 +387,14 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
     
     let socket = match tokio::net::UdpSocket::bind(std::net::SocketAddr::new(ip,0)).await {
         Err(e) => {
-            eprintln!("bind failed. {}", e);
+            error!("bind failed. {}", e);
             return;
         },
         Ok(s) => s
     };
 
     if let Err(e) = socket.connect(from).await {
-        eprintln!("connect to {} failed: {}", from, e);
+        error!("connect to {} failed: {}", from, e);
         return;
     }
 
@@ -395,14 +402,14 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
     if let Err(tftp_err) = handle_request(buflen, &mut buf, &socket).await {
         match tftp_err {
             TftpError::ClientSentErr{code,message} =>
-                println!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message),
+                error!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message),
             other_err => {
-                eprintln!("{} - E: {}", from, other_err);
+                error!("{} - E: {}", from, other_err);
                 if let Err(e) = create_error(&mut buf, 99, other_err) {
-                    eprintln!("{} - E: could not create error packet for client. [{}]", from, e);
+                    error!("{} - E: could not create error packet for client. [{}]", from, e);
                 } 
                 else if let Err(ioerr) = socket.send(buf.as_slice()).await {
-                    eprintln!("{} - E: could not send error message to client. [{}]", from, ioerr);
+                    error!("{} - E: could not send error message to client. [{}]", from, ioerr);
                 }
             }
         }
@@ -412,7 +419,7 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
 async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
     let sock69 = tokio::net::UdpSocket::bind(addr).await?;
 
-    println!("listening: {}", sock69.local_addr()?);
+    info!("listening: {}", sock69.local_addr()?);
 
     loop {
         let mut buf: Vec<u8> = vec![0; 1024];
@@ -429,11 +436,16 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
 //#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
-    let str_ip = env::args().nth(1).unwrap_or_else(|| Ipv6Addr::UNSPECIFIED.to_string());
+    //let str_ip = env::args().nth(1).unwrap_or_else(|| Ipv6Addr::UNSPECIFIED.to_string());
 
-    let ip = str_ip.parse()?;
+    let config = simplelog::ConfigBuilder::new()
+         .set_time_format_custom(simplelog::format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"))
+         .set_level_padding(simplelog::LevelPadding::Right)
+         .build();
 
-    let sock_addr = std::net::SocketAddr::new(ip, 69);
+    simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, config).unwrap();
+
+    let sock_addr = std::net::SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6969);
     accept_request(sock_addr).await?;
 
     Ok(())

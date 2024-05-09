@@ -10,6 +10,10 @@ edition = "2021"
 tokio = { version = "1", features = ["macros","rt","net","fs","io-util","time"] }
 futures = { version = "0.3" }
 thiserror = "1.0.56"
+simplelog = "0.12.2"
+log = "0.4.21"
+time = "0.3.36"
+
 
 [profile.dev]
 
