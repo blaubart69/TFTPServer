@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
 use std::str::Utf8Error;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{env, io};
 use std::io::Write;
@@ -10,9 +11,15 @@ use thiserror::Error;
 use tokio::time::error::Elapsed;
 
 #[macro_use] extern crate log;
-//use simplelog::*;
+use log::Level::Debug;
+use log::{debug, log_enabled};
 
-struct CmdOptions {
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
     max_blksize : Option<usize>
 }
 
@@ -59,9 +66,6 @@ impl std::fmt::Display for Options {
 }
 
 impl Options {
-    fn any_option_given(&self) -> bool {
-        Options::empty().ne(self)
-    }
 
     fn empty() -> Options {
         Options {
@@ -117,7 +121,9 @@ enum ProtocolError {
         expected: u16
     },
     #[error("client did not answer within {0} seconds")]
-    Timeout(u64)
+    Timeout(u64),
+    #[error("blocksize too small. ({0})")]
+    BlocksizeTooSmall(usize)
 }
 
 #[derive(Error,Debug)]
@@ -258,13 +264,18 @@ fn create_error(buf: &mut Vec<u8>, code : u16, message : impl std::fmt::Display)
     Ok(())
 }
 
-async fn create_oack(buf: &mut Vec<u8>, opts : &Options, filename : &str) -> std::io::Result<()> {
+async fn create_oack(buf: &mut Vec<u8>, opts : &Options, blocksize_used : usize, filename : &str) -> std::io::Result<()> {
     buf.clear();
     
     buf.extend_from_slice(OpCode::OACK.to_be_bytes().as_ref());
 
-    if let Some(blksize) = opts.blksize {
-        write!(buf,"blksize\0{}\0", blksize)?;    
+    if opts.blksize.is_none() && blocksize_used == 512 {
+        // client doesn't sent a blocksize.
+        // we calculated the default.
+        // => not sending back blksize in OACK
+    }
+    else {
+        write!(buf,"blksize\0{}\0", blocksize_used)?;    
     }
 
     if let Some(_tsize) = opts.tsize {
@@ -338,7 +349,7 @@ async fn send_block_wait_for_ack( buf: &mut Vec<u8>, expected_block_number : u16
     
 }
 
-fn printable_request(buf: &[u8]) -> String {
+fn bytes_to_string(buf: &[u8]) -> String {
     let mut str = String::new();
     for &c in buf {
         if c < 0x20 || c > 0x7e {
@@ -352,28 +363,48 @@ fn printable_request(buf: &[u8]) -> String {
     str
 }
 
-async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket) -> Result<(),TftpError> {
+async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::net::UdpSocket, args : &Args) -> Result<(),TftpError> {
 
     let req = {
         let reqbytes = &buf[0..reqlen];
         parse_request(reqbytes)?
     };
 
-    info!("{} - {} ({})", socket.peer_addr()?, req, printable_request(&buf[0..reqlen]));
+    info!("{} - {} ({})", socket.peer_addr()?, req, bytes_to_string(&buf[0..reqlen]));
     
     let mut file_reader = tokio::fs::File::options()
         .read(true)
         .open(req.filename.as_str())
         .await?;
 
-    if req.options.any_option_given() {
-        create_oack(&mut buf, &req.options, req.filename.as_str() ).await?;
+    let blocksize = req.options.blksize.unwrap_or(512);
+
+    let blksize_to_use = 
+        if blocksize < 8 {
+            Err(ProtocolError::BlocksizeTooSmall(blocksize))?
+        }
+        else if let Some(max_blocksize) = args.max_blksize {
+            if max_blocksize < blocksize {
+                max_blocksize
+            }
+            else {
+                blocksize
+            }
+        }
+        else {
+            blocksize
+        };
+
+    create_oack(&mut buf, &req.options, blksize_to_use, req.filename.as_str() ).await?;
+    if buf.len() > 2 {
+        if log_enabled!(Debug) {
+            debug!("OACK: {}", bytes_to_string(buf) );
+        }
         send_block_wait_for_ack(&mut buf, 0, &socket).await?;
     }
 
     let mut block_number : u16 = 1;
-    let blocksize = req.options.blksize.unwrap_or(512);
-
+    
     loop {
         let bytes_read = create_data(&mut buf, block_number, blocksize, &mut file_reader).await?;
         send_block_wait_for_ack(&mut buf, block_number, &socket).await?;
@@ -391,7 +422,7 @@ async fn handle_request(reqlen: usize, mut buf: &mut Vec<u8>, socket: &tokio::ne
 }
 
 
-async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
+async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr, args : Arc<Args>) {
 
     let ip = if from.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -414,24 +445,24 @@ async fn main_request(buflen: usize, mut buf: Vec<u8>, from: SocketAddr) {
     }
 
     //let handle_result = handle_request(buflen, &mut buf, &socket).await.map_err(|e| e.to_string() );
-    if let Err(tftp_err) = handle_request(buflen, &mut buf, &socket).await {
+    if let Err(tftp_err) = handle_request(buflen, &mut buf, &socket, args.as_ref()).await {
         match tftp_err {
             TftpError::ClientSentErr{code,message} =>
                 error!("{} - client sent error. code {} message {}. quitting transfer.", from, code, message),
             other_err => {
-                error!("{} - E: {}", from, other_err);
+                error!("{} - {}", from, other_err);
                 if let Err(e) = create_error(&mut buf, 99, other_err) {
-                    error!("{} - E: could not create error packet for client. [{}]", from, e);
+                    error!("{} - could not create error packet for client. [{}]", from, e);
                 } 
                 else if let Err(ioerr) = socket.send(buf.as_slice()).await {
-                    error!("{} - E: could not send error message to client. [{}]", from, ioerr);
+                    error!("{} - could not send error message to client. [{}]", from, ioerr);
                 }
             }
         }
     }
 }
 
-async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
+async fn accept_request(addr: SocketAddr, args : Arc<Args>) -> Result<(), io::Error> {
     let sock69 = tokio::net::UdpSocket::bind(addr).await?;
 
     info!("listening: {}", sock69.local_addr()?);
@@ -440,9 +471,9 @@ async fn accept_request(addr: SocketAddr) -> Result<(), io::Error> {
         let mut buf: Vec<u8> = vec![0; 1024];
 
         match sock69.recv_from(&mut buf[..]).await {
-            Err(e) => eprintln!("{}", e),
+            Err(e) => error!("{}", e),
             Ok((buflen, from)) => {
-                tokio::spawn( main_request(buflen, buf, from) );
+                tokio::spawn( main_request(buflen, buf, from, args.clone() ) );
             }
         }
     }
@@ -453,15 +484,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //let str_ip = env::args().nth(1).unwrap_or_else(|| "0.0.0.0".to_string());
     //let str_ip = env::args().nth(1).unwrap_or_else(|| Ipv6Addr::UNSPECIFIED.to_string());
 
+    let args = Args::parse();
+
     let config = simplelog::ConfigBuilder::new()
          .set_time_format_custom(simplelog::format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"))
          .set_level_padding(simplelog::LevelPadding::Right)
          .build();
 
-    simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, config).unwrap();
+    simplelog::SimpleLogger::init(simplelog::LevelFilter::Debug, config).unwrap();
 
     let sock_addr = std::net::SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6969);
-    accept_request(sock_addr).await?;
+    let a = Arc::new(args);
+    accept_request(sock_addr, a.clone()).await?;
 
     Ok(())
 }
@@ -511,11 +545,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn test_empty_options() {
-        let empty = Options::empty();
-        assert!( empty.any_option_given() == false );
-    }
     #[tokio::test]
     async fn test_create_oack() {
         let mut buf = Vec::<u8>::new();
@@ -525,7 +554,8 @@ mod tests {
             &Options {
                   blksize : Some(1024)
                 , timeout : None
-                , tsize   : None }, 
+                , tsize   : None },
+                512, 
             "dummy").await.unwrap();
 
         assert!(buf.len() > 0);
@@ -540,7 +570,7 @@ mod tests {
     #[test]
     fn test_print_raw_request() {
         let req  = [1u8, 2, 0x66, 0x69, 0x6C, 0x65, 0x6E, 0x61, 0x6D, 0x65, 0, 0x4D, 0x4F, 0x44, 0x45, 0];
-        let str_req = printable_request(&req);
+        let str_req = bytes_to_string(&req);
         assert_eq!("\\x1\\x2filename\\x0MODE\\x0".to_owned(), str_req);
     }
 

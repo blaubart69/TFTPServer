@@ -13,6 +13,7 @@ thiserror = "1.0.56"
 simplelog = "0.12.2"
 log = "0.4.21"
 time = "0.3.36"
+clap = { version = "4.5.4", features = ["derive"] }
 
 
 [profile.dev]
