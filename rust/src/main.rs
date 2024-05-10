@@ -487,8 +487,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let config = simplelog::ConfigBuilder::new()
-         .set_time_format_custom(simplelog::format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"))
          .set_level_padding(simplelog::LevelPadding::Right)
+         .set_time_format_custom(simplelog::format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"))
+         .set_time_offset_to_local().expect("logger: set_time_offset_to_local()")
          .build();
 
     simplelog::SimpleLogger::init(simplelog::LevelFilter::Debug, config).unwrap();
