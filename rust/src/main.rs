@@ -494,6 +494,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     simplelog::SimpleLogger::init(simplelog::LevelFilter::Debug, config).unwrap();
 
+    // !!! port 69 !!!
+    //  sudo setcap 'cap_net_bind_service=+ep' target/debug/tftpd_rust
+    // 
     let sock_addr = std::net::SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6969);
     let a = Arc::new(args);
     accept_request(sock_addr, a.clone()).await?;
