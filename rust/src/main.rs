@@ -1,8 +1,8 @@
 use std::net::{SocketAddr, Ipv6Addr, IpAddr, Ipv4Addr};
-use std::str::Utf8Error;
+use std::str::{Utf8Error};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, io};
+use std::{io};
 use std::io::Write;
 
 use tokio::io::AsyncReadExt;
@@ -20,7 +20,11 @@ use clap::Parser;
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    max_blksize : Option<usize>
+    max_blksize : Option<usize>,
+    #[arg(short, long, default_value="::")]
+    ip : IpAddr,
+    #[arg(short, long, default_value="69")]
+    port : u16
 }
 
 #[non_exhaustive]
@@ -496,8 +500,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // !!! port 69 !!!
     //  sudo setcap 'cap_net_bind_service=+ep' target/debug/tftpd_rust
-    // 
-    let sock_addr = std::net::SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 6969);
+    let sock_addr = std::net::SocketAddr::new( args.ip, args.port );
+
     let a = Arc::new(args);
     accept_request(sock_addr, a.clone()).await?;
 
